@@ -9,9 +9,12 @@ LON = -73.9661
 NY = ZoneInfo("America/New_York")
 
 TOMORROW_KEY = "iqAjw2K5LNqSOLQfBbYASQ1izFV51xjy"
-DB_PATH = "/data/weatheredge.sqlite"
+import os
+DB_PATH = os.getenv("DB_PATH", "/var/data/weatheredge.sqlite")
 
 def db():
+    # ✅ Ensure folder exists (Render Disk)
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
     CREATE TABLE IF NOT EXISTS hourly_forecast (
