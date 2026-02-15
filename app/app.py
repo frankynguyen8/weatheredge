@@ -1,0 +1,33 @@
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
+import subprocess, os
+
+app = FastAPI()
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+@app.get("/api/run")
+def run_once():
+    # chạy script hiện tại của bạn (main.py) 1 lần và trả output
+    p = subprocess.run(["python", "main.py"], capture_output=True, text=True)
+    return {
+        "ok": p.returncode == 0,
+        "code": p.returncode,
+        "stdout": p.stdout[-5000:],  # tránh quá dài
+        "stderr": p.stderr[-5000:],
+    }
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <html>
+      <head><meta name="viewport" content="width=device-width, initial-scale=1"/></head>
+      <body style="font-family: -apple-system, Arial; padding:16px;">
+        <h2>WeatherEdge</h2>
+        <p><a href="/api/run">Run now</a> (chạy 1 lần và xem kết quả)</p>
+        <p><a href="/health">Health</a></p>
+      </body>
+    </html>
+    """
