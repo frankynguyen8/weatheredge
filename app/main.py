@@ -253,7 +253,6 @@ def main():
 def home():
     return "WeatherEdge is running! Try /api/run"
 
-@app.get("/api/run")
 def api_run():
     try:
         out = run_once()   # run_once() phải trả về string output
