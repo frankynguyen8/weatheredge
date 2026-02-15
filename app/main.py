@@ -185,71 +185,87 @@ def fractional_kelly(p, price, fraction=0.25):
     return max(0.0, raw) * fraction
 
 def run_once():
+    lines = []
+
     con = db()
 
-    print("Fetching Open-Meteo...")
+    lines.append("Fetching Open-Meteo...")
     insert_rows(con, "open_meteo", fetch_open_meteo())
 
-    print("Fetching Weather.gov...")
+    lines.append("Fetching Weather.gov...")
     insert_rows(con, "weather_gov", fetch_weather_gov())
 
-    print("Fetching Tomorrow.io...")
+    lines.append("Fetching Tomorrow.io...")
     insert_rows(con, "tomorrow_io", fetch_tomorrow_io())
 
     by_source = load_recent(con, hours=6)
-    print("\nSources:", list(by_source.keys()))
+    lines.append(f"Sources: {list(by_source.keys())}")
 
     for src, series in by_source.items():
         nxt = next_n_hours(series, 18)
-        print(f"\n--- {src}: next {len(nxt)} hours (UTC) ---")
+        lines.append(f"\n--- {src}: next {len(nxt)} hours (UTC) ---")
         for dt, tf in nxt:
-            print(dt.isoformat(), f"{tf:.1f}F")
+            lines.append(f"{dt.isoformat()}  {tf:.1f}F")
 
     mean, sigma, per, removed = consensus_tomorrow_max(by_source)
     if mean is None:
-        print("\nNo tomorrow data within current horizon.")
-        return
+        lines.append("\nNo tomorrow data within current horizon.")
+        return "\n".join(lines)
 
-    print("\nTomorrow (NY) max per source:")
+    lines.append("\nTomorrow (NY) max per source:")
     for src, mx in per.items():
-        print(f"  {src}: {mx:.2f}F")
+        lines.append(f"  {src}: {mx:.2f}F")
     if removed:
-        print("Outliers removed:", removed)
+        lines.append(f"Outliers removed: {removed}")
 
     base_sigma = 2.0
     sigma_total = float(np.sqrt(base_sigma**2 + sigma**2))
 
-    print(f"\nConsensus tomorrow max (NY): {mean:.2f}F")
-    print(f"Model spread sigma: {sigma:.2f}F | Base sigma: {base_sigma:.2f}F | Total sigma: {sigma_total:.2f}F")
+    lines.append(f"\nConsensus tomorrow max (NY): {mean:.2f}F")
+    lines.append(f"Model spread sigma: {sigma:.2f}F | Base sigma: {base_sigma:.2f}F | Total sigma: {sigma_total:.2f}F")
 
     threshold = 48.0
     p_over = monte_carlo_prob_over(threshold, mean, sigma_total)
-    print(f"\nMonte Carlo P(TMAX > {threshold:.0f}F): {p_over*100:.2f}%")
+    lines.append(f"\nMonte Carlo P(TMAX > {threshold:.0f}F): {p_over*100:.2f}%")
 
     market_price = read_market_price()
     edge = p_over - market_price
     kelly = fractional_kelly(p_over, market_price, fraction=0.25)
 
-    print(f"\nMarket price YES(>{threshold:.0f}F): {market_price*100:.2f}%")
-    print(f"Model prob: {p_over*100:.2f}% | Edge: {edge*100:.2f}%")
-    print(f"Suggested stake (25% Kelly): {kelly*100:.2f}% bankroll")
+    lines.append(f"\nMarket price YES(>{threshold:.0f}F): {market_price*100:.2f}%")
+    lines.append(f"Model prob: {p_over*100:.2f}% | Edge: {edge*100:.2f}%")
+    lines.append(f"Suggested stake (25% Kelly): {kelly*100:.2f}% of bankroll")
+
+    return "\n".join(lines)
 
 def main():
     run_once()
+# ==========================
+# WEB API (Render Endpoint)
+# ==========================
+
+from flask import Flask, Response, jsonify, request
+
+app = Flask(__name__)
+
+@app.get("/")
+def home():
+    return "WeatherEdge is running! Try /api/run"
+
+@app.get("/api/run")
+def api_run():
+    try:
+        out = run_once()   # run_once() phải trả về string output
+
+        # Nếu muốn JSON thì thêm ?format=json
+        if request.args.get("format") == "json":
+            return jsonify(ok=True, output=out.splitlines())
+
+        # Mặc định trả text/plain để đọc đẹp
+        return Response(out + "\n", mimetype="text/plain; charset=utf-8")
+
+    except Exception as e:
+        return jsonify(ok=False, error=str(e))
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--loop", action="store_true")
-    args = parser.parse_args()
-
-    if not args.loop:
-        main()
-    else:
-        while True:
-            print("\n================ RUN =================")
-            try:
-                main()
-            except Exception as e:
-                print("Run error:", e)
-            print("Sleep 10 minutes...\n")
-            time.sleep(600)
+    app.run(host="0.0.0.0", port=10000)
