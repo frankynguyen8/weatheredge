@@ -238,6 +238,15 @@ def run_once():
 
     return "\n".join(lines)
 
+def run_once_text() -> str:
+    import io
+    from contextlib import redirect_stdout
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        run_once()
+    return buf.getvalue()
+
 def main():
     run_once()
 
