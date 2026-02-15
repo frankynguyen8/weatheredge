@@ -240,15 +240,7 @@ def run_once():
 
 def main():
     run_once()
-# ==========================
-# WEB API (Render Endpoint)
-# ==========================
 
-from flask import Flask, Response, jsonify, request
-
-app = Flask(__name__)
-
-@app.get("/")
 def home():
     return "WeatherEdge is running! Try /api/run"
 
@@ -266,6 +258,3 @@ def api_run():
 
     except Exception as e:
         return jsonify(ok=False, error=str(e))
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
