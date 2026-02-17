@@ -153,34 +153,49 @@ def fetch_weather_gov(horizon_hours=48):
 
 def fetch_tomorrow_io(horizon_hours=48):
     if not TOMORROW_KEY:
+        print("Tomorrow.io: Missing API key")
         return []
 
-    url = (
-        "https://api.tomorrow.io/v4/weather/forecast"
-        f"?location={LAT},{LON}"
-        "&fields=temperature"
-        "&timesteps=1h"
-        "&units=imperial"
-        f"&apikey={TOMORROW_KEY}"
-    )
-    r = safe_get(url)
+    url = "https://api.tomorrow.io/v4/timelines"
+
+    payload = {
+        "location": f"{LAT},{LON}",
+        "fields": ["temperature"],
+        "timesteps": ["1h"],
+        "units": "imperial"
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "apikey": TOMORROW_KEY
+    }
+
+    r = safe_get(url, headers=headers)
+
     if not r:
-        print("Tomorrow.io: Request failed")
+        print("Tomorrow.io request failed")
         return []
- # ✅ Debug status code
+
     if r.status_code != 200:
         print("Tomorrow.io ERROR:", r.status_code, r.text)
         return []
-        
+
     try:
         j = r.json()
+
         rows = []
-        for it in j["timelines"]["hourly"]:
-            dt = datetime.fromisoformat(it["time"].replace("Z", "+00:00")).astimezone(timezone.utc)
+        for it in j["data"]["timelines"][0]["intervals"]:
+            dt = datetime.fromisoformat(it["startTime"].replace("Z", "+00:00"))
+            tf = float(it["values"]["temperature"])
+
             if in_horizon(dt, horizon_hours):
-                rows.append((dt.isoformat(), float(it["values"]["temperature"])))
+                rows.append((dt.isoformat(), tf))
+
+        print("Tomorrow.io OK rows:", len(rows))
         return rows
-    except Exception:
+
+    except Exception as e:
+        print("Tomorrow.io parse error:", e)
         return []
 
 # --------- stats & betting ---------
