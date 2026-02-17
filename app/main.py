@@ -16,24 +16,37 @@ NY = ZoneInfo("America/New_York")
 DB_PATH = os.getenv("DB_PATH", "/var/data/weatheredge.sqlite")
 TOMORROW_KEY = os.getenv("TOMORROW_KEY", "")
 
-# --------- HTTP safe get ---------
+EXPECTED_SOURCES = ["open_meteo", "weather_gov", "tomorrow_io"]
+
+# -------------------- HTTP safe get --------------------
 
 def safe_get(url: str, headers=None, timeout=15, retries=3, backoff=1.8):
     headers = headers or {}
     for i in range(retries):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
-
             if r.status_code == 429 or (500 <= r.status_code <= 599):
                 time.sleep(backoff * (i + 1))
                 continue
-
             return r
         except requests.RequestException:
             time.sleep(backoff * (i + 1))
     return None
 
-# --------- DB ---------
+def safe_post(url: str, headers=None, json_body=None, timeout=15, retries=3, backoff=1.8):
+    headers = headers or {}
+    for i in range(retries):
+        try:
+            r = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            if r.status_code == 429 or (500 <= r.status_code <= 599):
+                time.sleep(backoff * (i + 1))
+                continue
+            return r
+        except requests.RequestException:
+            time.sleep(backoff * (i + 1))
+    return None
+
+# -------------------- DB --------------------
 
 def db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -73,7 +86,7 @@ def load_recent(con, hours=6):
         by_source[src].sort(key=lambda x: x[0])
     return by_source
 
-# --------- time helpers ---------
+# -------------------- time helpers --------------------
 
 def in_horizon(dt: datetime, horizon_hours=48):
     now = datetime.now(timezone.utc)
@@ -86,10 +99,6 @@ def next_n_hours(series, n=10):
     return out[:n]
 
 def day_minmax_ny(series, day_offset=1):
-    """
-    day_offset=1 => tomorrow in NY
-    Returns (min,max) in Fahrenheit or (None,None)
-    """
     target = (datetime.now(NY) + timedelta(days=day_offset)).date()
     vals = []
     for dt_utc, tf in series:
@@ -100,7 +109,29 @@ def day_minmax_ny(series, day_offset=1):
         return None, None
     return float(min(vals)), float(max(vals))
 
-# --------- fetchers ---------
+def last_hours_now_minmax(series, hours=8):
+    """
+    Return (now_temp, min_last_h, max_last_h) in last N hours (UTC window)
+    now_temp = latest datapoint <= now, or None if not found
+    """
+    if not series:
+        return None, None, None
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=hours)
+
+    # min/max within last hours
+    window_vals = [tf for dt, tf in series if start <= dt <= now]
+    mn = float(min(window_vals)) if window_vals else None
+    mx = float(max(window_vals)) if window_vals else None
+
+    # "now" = latest value <= now
+    past = [(dt, tf) for dt, tf in series if dt <= now]
+    now_tf = float(past[-1][1]) if past else None
+
+    return now_tf, mn, mx
+
+# -------------------- fetchers --------------------
 
 def fetch_open_meteo(horizon_hours=48):
     url = (
@@ -111,9 +142,8 @@ def fetch_open_meteo(horizon_hours=48):
         "&timezone=UTC"
     )
     r = safe_get(url)
-    if not r:
+    if not r or r.status_code != 200:
         return []
-
     try:
         j = r.json()
         rows = []
@@ -128,18 +158,15 @@ def fetch_open_meteo(horizon_hours=48):
 def fetch_weather_gov(horizon_hours=48):
     headers = {"User-Agent": "WeatherEdge", "Accept": "application/geo+json"}
     p = safe_get(f"https://api.weather.gov/points/{LAT},{LON}", headers=headers)
-    if not p:
+    if not p or p.status_code != 200:
         return []
-
     try:
         forecast_url = p.json()["properties"]["forecastHourly"]
     except Exception:
         return []
-
     r = safe_get(forecast_url, headers=headers)
-    if not r:
+    if not r or r.status_code != 200:
         return []
-
     try:
         periods = r.json()["properties"]["periods"]
         rows = []
@@ -152,53 +179,37 @@ def fetch_weather_gov(horizon_hours=48):
         return []
 
 def fetch_tomorrow_io(horizon_hours=48):
+    # Use v4/timelines (recommended)
     if not TOMORROW_KEY:
-        print("Tomorrow.io: Missing API key")
         return []
 
     url = "https://api.tomorrow.io/v4/timelines"
-
     payload = {
         "location": f"{LAT},{LON}",
         "fields": ["temperature"],
         "timesteps": ["1h"],
-        "units": "imperial"
+        "units": "imperial",
     }
+    headers = {"Content-Type": "application/json", "apikey": TOMORROW_KEY}
 
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": TOMORROW_KEY
-    }
-
-    r = safe_get(url, headers=headers)
-
-    if not r:
-        print("Tomorrow.io request failed")
-        return []
-
-    if r.status_code != 200:
-        print("Tomorrow.io ERROR:", r.status_code, r.text)
+    r = safe_post(url, headers=headers, json_body=payload)
+    if not r or r.status_code != 200:
         return []
 
     try:
         j = r.json()
-
+        intervals = j["data"]["timelines"][0]["intervals"]
         rows = []
-        for it in j["data"]["timelines"][0]["intervals"]:
+        for it in intervals:
             dt = datetime.fromisoformat(it["startTime"].replace("Z", "+00:00"))
             tf = float(it["values"]["temperature"])
-
             if in_horizon(dt, horizon_hours):
                 rows.append((dt.isoformat(), tf))
-
-        print("Tomorrow.io OK rows:", len(rows))
         return rows
-
-    except Exception as e:
-        print("Tomorrow.io parse error:", e)
+    except Exception:
         return []
 
-# --------- stats & betting ---------
+# -------------------- stats & betting --------------------
 
 def remove_outliers_iqr(values_dict):
     vals = np.array(list(values_dict.values()), dtype=float)
@@ -229,15 +240,18 @@ def fractional_kelly(p, price, fraction=0.25):
     raw = (p - price) / (1 - price)
     return max(0.0, raw) * fraction
 
-# --------- result model ---------
+# -------------------- result model --------------------
 
 @dataclass
 class SourceSummary:
     src: str
     rows_inserted: int
-    next_hours: list  # list[(dt_iso, temp)]
-    tmr_min: float | None
-    tmr_max: float | None
+    status: str  # OK / EMPTY / NO_KEY
+    now_f: float | None
+    last8h_min_f: float | None
+    last8h_max_f: float | None
+    tmr_min_f: float | None
+    tmr_max_f: float | None
 
 @dataclass
 class RunResult:
@@ -245,19 +259,30 @@ class RunResult:
     generated_at_utc: str
     lat: float
     lon: float
+
     ny_date_tomorrow: str
+
     sources: list  # list[SourceSummary]
-    consensus_min: float | None
-    consensus_max: float | None
     removed_outliers: list
+    notes: list
+
+    # Consensus now & last 8h
+    consensus_now_f: float | None
+    consensus_last8h_min_f: float | None
+    consensus_last8h_max_f: float | None
+
+    # Tomorrow consensus
+    consensus_tmr_min_f: float | None
+    consensus_tmr_max_f: float | None
+
+    # Betting
     threshold_f: float
     p_over: float | None
     market_price: float | None
     edge: float | None
     stake: float | None
-    notes: list
 
-# --------- main runner ---------
+# -------------------- main runner --------------------
 
 def run_once_struct() -> RunResult:
     con = db()
@@ -271,61 +296,101 @@ def run_once_struct() -> RunResult:
 
     by_source = load_recent(con, hours=6)
 
-    src_summaries = []
-    per_min = {}
-    per_max = {}
+    # per-source now/8h + tomorrow
+    per_now = {}
+    per_8h_min = {}
+    per_8h_max = {}
+    per_tmr_min = {}
+    per_tmr_max = {}
 
-    for src, series in by_source.items():
-        nxt = [(dt.isoformat(), float(tf)) for dt, tf in next_n_hours(series, 10)]
+    src_summaries = []
+
+    for src in EXPECTED_SOURCES:
+        series = by_source.get(src, [])
+        status = "OK"
+        if src == "tomorrow_io" and not TOMORROW_KEY:
+            status = "NO_KEY"
+        elif not series:
+            status = "EMPTY"
+
+        now_f, mn8, mx8 = last_hours_now_minmax(series, hours=8)
         tmin, tmax = day_minmax_ny(series, day_offset=1)
+
+        if now_f is not None:
+            per_now[src] = now_f
+        if mn8 is not None:
+            per_8h_min[src] = mn8
+        if mx8 is not None:
+            per_8h_max[src] = mx8
+        if tmin is not None:
+            per_tmr_min[src] = tmin
+        if tmax is not None:
+            per_tmr_max[src] = tmax
 
         src_summaries.append(
             SourceSummary(
                 src=src,
                 rows_inserted=inserts.get(src, 0),
-                next_hours=nxt,
-                tmr_min=tmin,
-                tmr_max=tmax
+                status=status,
+                now_f=now_f,
+                last8h_min_f=mn8,
+                last8h_max_f=mx8,
+                tmr_min_f=tmin,
+                tmr_max_f=tmax,
             )
         )
 
-        if tmin is not None and tmax is not None:
-            per_min[src] = tmin
-            per_max[src] = tmax
-
-    # consensus min/max (outlier filter on both)
-    consensus_min = consensus_max = None
     removed = []
 
-    if per_min and per_max:
-        min_filtered = remove_outliers_iqr(per_min)
-        max_filtered = remove_outliers_iqr(per_max)
+    # Consensus now + last 8h (simple mean with outlier filter when enough)
+    consensus_now = None
+    consensus_8h_min = None
+    consensus_8h_max = None
 
-        removed = sorted(set(per_min.keys()) - set(min_filtered.keys()) |
-                         set(per_max.keys()) - set(max_filtered.keys()))
+    if per_now:
+        per_now_f = remove_outliers_iqr(per_now)
+        removed = sorted(set(removed) | (set(per_now.keys()) - set(per_now_f.keys())))
+        consensus_now = float(np.mean(list(per_now_f.values())))
 
-        consensus_min = float(np.mean(list(min_filtered.values())))
-        consensus_max = float(np.mean(list(max_filtered.values())))
+    if per_8h_min:
+        per_min_f = remove_outliers_iqr(per_8h_min)
+        removed = sorted(set(removed) | (set(per_8h_min.keys()) - set(per_min_f.keys())))
+        consensus_8h_min = float(np.mean(list(per_min_f.values())))
+
+    if per_8h_max:
+        per_max_f = remove_outliers_iqr(per_8h_max)
+        removed = sorted(set(removed) | (set(per_8h_max.keys()) - set(per_max_f.keys())))
+        consensus_8h_max = float(np.mean(list(per_max_f.values())))
+
+    # Tomorrow consensus min/max
+    consensus_tmr_min = consensus_tmr_max = None
+    if per_tmr_min and per_tmr_max:
+        tmr_min_f = remove_outliers_iqr(per_tmr_min)
+        tmr_max_f = remove_outliers_iqr(per_tmr_max)
+        removed = sorted(set(removed) |
+                         (set(per_tmr_min.keys()) - set(tmr_min_f.keys())) |
+                         (set(per_tmr_max.keys()) - set(tmr_max_f.keys())))
+        consensus_tmr_min = float(np.mean(list(tmr_min_f.values())))
+        consensus_tmr_max = float(np.mean(list(tmr_max_f.values())))
     else:
-        notes.append("Not enough tomorrow (NY) data to compute MIN/MAX consensus.")
+        notes.append("Not enough tomorrow (NY) data to compute consensus MIN/MAX.")
 
-    # probability model (use consensus_max as tmax mean)
+    # Betting model based on consensus tomorrow MAX
     threshold = 48.0
     p_over = market = edge = stake = None
 
-    if consensus_max is not None:
-        # spread from sources (std of max), plus base sigma
-        vals = list(per_max.values())
+    if consensus_tmr_max is not None:
+        vals = list(per_tmr_max.values())
         spread = float(np.std(vals)) if len(vals) > 1 else 2.0
         base_sigma = 2.0
         sigma_total = float(np.sqrt(base_sigma**2 + spread**2))
 
-        p_over = monte_carlo_prob_over(threshold, consensus_max, sigma_total)
+        p_over = monte_carlo_prob_over(threshold, consensus_tmr_max, sigma_total)
         market = read_market_price()
         edge = p_over - market
         stake = fractional_kelly(p_over, market, fraction=0.25)
     else:
-        notes.append("Skipped probability model because consensus_max is None.")
+        notes.append("Skipped probability model because consensus_tmr_max is None.")
 
     tomorrow_ny = (datetime.now(NY) + timedelta(days=1)).date().isoformat()
 
@@ -335,47 +400,54 @@ def run_once_struct() -> RunResult:
         lat=LAT,
         lon=LON,
         ny_date_tomorrow=tomorrow_ny,
+
         sources=src_summaries,
-        consensus_min=consensus_min,
-        consensus_max=consensus_max,
         removed_outliers=removed,
+        notes=notes,
+
+        consensus_now_f=consensus_now,
+        consensus_last8h_min_f=consensus_8h_min,
+        consensus_last8h_max_f=consensus_8h_max,
+
+        consensus_tmr_min_f=consensus_tmr_min,
+        consensus_tmr_max_f=consensus_tmr_max,
+
         threshold_f=threshold,
         p_over=p_over,
         market_price=market,
         edge=edge,
         stake=stake,
-        notes=notes
     )
 
 def run_once_text() -> str:
-    # Keep a compact text output for /api/run
     rr = run_once_struct()
+    def ff(x): return "N/A" if x is None else f"{x:.1f}F"
+
     lines = []
     lines.append(f"Generated: {rr.generated_at_utc}")
     lines.append(f"Location: {rr.lat},{rr.lon}")
     lines.append(f"Tomorrow (NY): {rr.ny_date_tomorrow}")
 
-    for s in rr.sources:
-        lines.append(f"\n[{s.src}] inserted={s.rows_inserted}")
-        if s.tmr_min is not None and s.tmr_max is not None:
-            lines.append(f"Tomorrow MIN/MAX: {s.tmr_min:.1f}F / {s.tmr_max:.1f}F")
-        else:
-            lines.append("Tomorrow MIN/MAX: N/A")
+    lines.append("\nNOW + last 8h:")
+    lines.append(f"Consensus now/min/max: {ff(rr.consensus_now_f)} / {ff(rr.consensus_last8h_min_f)} / {ff(rr.consensus_last8h_max_f)}")
 
-    if rr.consensus_min is not None and rr.consensus_max is not None:
-        lines.append(f"\nConsensus MIN/MAX: {rr.consensus_min:.1f}F / {rr.consensus_max:.1f}F")
+    for s in rr.sources:
+        lines.append(f"\n[{s.src}] status={s.status} inserted={s.rows_inserted}")
+        lines.append(f"Now / 8h MIN / 8h MAX: {ff(s.now_f)} / {ff(s.last8h_min_f)} / {ff(s.last8h_max_f)}")
+        lines.append(f"Tomorrow NY MIN/MAX: {ff(s.tmr_min_f)} / {ff(s.tmr_max_f)}")
+
+    if rr.consensus_tmr_min_f is not None and rr.consensus_tmr_max_f is not None:
+        lines.append(f"\nTomorrow consensus MIN/MAX: {ff(rr.consensus_tmr_min_f)} / {ff(rr.consensus_tmr_max_f)}")
     else:
-        lines.append("\nConsensus MIN/MAX: N/A")
+        lines.append("\nTomorrow consensus MIN/MAX: N/A")
 
     if rr.p_over is not None:
         lines.append(f"P(TMAX > {rr.threshold_f:.0f}F): {rr.p_over*100:.2f}%")
         lines.append(f"Market YES: {rr.market_price*100:.2f}% | Edge: {rr.edge*100:.2f}%")
         lines.append(f"Stake (25% Kelly): {rr.stake*100:.2f}%")
-    else:
-        lines.append("Model probability: N/A")
 
     if rr.removed_outliers:
-        lines.append(f"Outliers removed: {rr.removed_outliers}")
+        lines.append(f"\nOutliers removed: {rr.removed_outliers}")
 
     if rr.notes:
         lines.append("\nNotes:")
