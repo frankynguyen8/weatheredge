@@ -165,8 +165,13 @@ def fetch_tomorrow_io(horizon_hours=48):
     )
     r = safe_get(url)
     if not r:
+        print("Tomorrow.io: Request failed")
         return []
-
+ # ✅ Debug status code
+    if r.status_code != 200:
+        print("Tomorrow.io ERROR:", r.status_code, r.text)
+        return []
+        
     try:
         j = r.json()
         rows = []
