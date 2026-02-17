@@ -11,20 +11,20 @@ import requests
 
 # ---------------- CONFIG ----------------
 
-LAT = float(os.getenv("LAT", "40.78858"))
-LON = float(os.getenv("LON", "-73.9661"))
-NY = ZoneInfo("America/New_York")
-
 DB_PATH = os.getenv("DB_PATH", "/var/data/weatheredge.sqlite")
 TOMORROW_KEY = os.getenv("TOMORROW_KEY", "").strip()
 
-# Kalshi (market data)
-KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER", "").strip()
-KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
+# Default location (still used if user doesn't provide query)
+DEFAULT_LAT = float(os.getenv("LAT", "40.78858"))
+DEFAULT_LON = float(os.getenv("LON", "-73.9661"))
 
 EXPECTED_SOURCES = ["open_meteo", "weather_gov", "tomorrow_io"]
 
-# ---------------- HTTP (safe) ----------------
+# Kalshi (optional - keeps your previous integration style)
+KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER", "").strip()
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
+
+# ---------------- HTTP SAFE ----------------
 
 def safe_get(url: str, headers=None, timeout=15, retries=3, backoff=1.8):
     headers = headers or {}
@@ -52,38 +52,112 @@ def safe_post(url: str, headers=None, json_body=None, timeout=15, retries=3, bac
             time.sleep(backoff * (i + 1))
     return None
 
+# ---------------- GEOCODE (USA) ----------------
+# Uses Open-Meteo geocoding API (free)
+
+def geocode_us(query: str, count: int = 5):
+    """
+    Returns list of candidates in US:
+      {name, admin1, latitude, longitude, timezone, country_code}
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+
+    url = (
+        "https://geocoding-api.open-meteo.com/v1/search"
+        f"?name={requests.utils.quote(q)}&count={count}&language=en&format=json"
+    )
+    r = safe_get(url, timeout=15, retries=2)
+    if not r or r.status_code != 200:
+        return []
+
+    try:
+        j = r.json()
+        out = []
+        for it in j.get("results", []) or []:
+            if it.get("country_code") != "US":
+                continue
+            out.append({
+                "name": it.get("name"),
+                "admin1": it.get("admin1"),
+                "latitude": float(it.get("latitude")),
+                "longitude": float(it.get("longitude")),
+                "timezone": it.get("timezone"),
+                "country_code": it.get("country_code"),
+            })
+        return out
+    except Exception:
+        return []
+
+def resolve_location(q: str | None, lat: float | None, lon: float | None):
+    """
+    Priority:
+      - if lat/lon provided -> use them
+      - else if q provided -> geocode first match in US
+      - else -> default env location
+    Returns: (lat, lon, display_name, tz_name)
+    """
+    if lat is not None and lon is not None:
+        # no display name; timezone can be fetched from open-meteo later; keep UTC fallback
+        return float(lat), float(lon), f"{lat:.4f},{lon:.4f}", "UTC"
+
+    q = (q or "").strip()
+    if q:
+        cands = geocode_us(q, count=5)
+        if cands:
+            top = cands[0]
+            name = top["name"]
+            admin1 = top["admin1"]
+            disp = f"{name}, {admin1}" if admin1 else name
+            tz = top.get("timezone") or "UTC"
+            return top["latitude"], top["longitude"], disp, tz
+
+    return DEFAULT_LAT, DEFAULT_LON, f"{DEFAULT_LAT:.4f},{DEFAULT_LON:.4f}", "UTC"
+
 # ---------------- DB ----------------
 
-def db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+def ensure_schema(con: sqlite3.Connection):
     con.execute("""
         CREATE TABLE IF NOT EXISTS hourly_forecast(
             source TEXT,
+            lat REAL,
+            lon REAL,
             time_utc TEXT,
             temp_f REAL,
             fetched_at_utc TEXT
         )
     """)
     con.commit()
+
+def db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    ensure_schema(con)
     return con
 
-def insert_rows(con, source, rows):
+def insert_rows(con, source, lat, lon, rows):
     if not rows:
         return 0
     fetched = datetime.now(timezone.utc).isoformat()
     con.executemany(
-        "INSERT INTO hourly_forecast(source,time_utc,temp_f,fetched_at_utc) VALUES (?,?,?,?)",
-        [(source, t, tf, fetched) for (t, tf) in rows]
+        "INSERT INTO hourly_forecast(source,lat,lon,time_utc,temp_f,fetched_at_utc) VALUES (?,?,?,?,?,?)",
+        [(source, float(lat), float(lon), t, tf, fetched) for (t, tf) in rows]
     )
     con.commit()
     return len(rows)
 
-def load_recent(con, hours=6):
+def load_recent(con, lat, lon, hours=6):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
     cur = con.execute(
-        "SELECT source, time_utc, temp_f FROM hourly_forecast WHERE fetched_at_utc >= ?",
-        (cutoff,)
+        """
+        SELECT source, time_utc, temp_f
+        FROM hourly_forecast
+        WHERE fetched_at_utc >= ?
+          AND ABS(lat - ?) < 0.00001
+          AND ABS(lon - ?) < 0.00001
+        """,
+        (cutoff, float(lat), float(lon))
     )
     by_source = {}
     for src, t, tf in cur.fetchall():
@@ -99,12 +173,15 @@ def in_horizon(dt: datetime, horizon_hours=48):
     end = now + timedelta(hours=horizon_hours)
     return now <= dt <= end
 
-def day_minmax_ny(series, day_offset=1):
-    target = (datetime.now(NY) + timedelta(days=day_offset)).date()
+def day_minmax_local(series, local_tz: ZoneInfo, day_offset=1):
+    """
+    Tomorrow based on local timezone for the chosen location
+    """
+    target = (datetime.now(local_tz) + timedelta(days=day_offset)).date()
     vals = []
     for dt_utc, tf in series:
-        dt_ny = dt_utc.astimezone(NY)
-        if dt_ny.date() == target:
+        dt_loc = dt_utc.astimezone(local_tz)
+        if dt_loc.date() == target:
             vals.append(float(tf))
     if not vals:
         return None, None
@@ -112,8 +189,8 @@ def day_minmax_ny(series, day_offset=1):
 
 def last_hours_now_minmax(series, hours=8):
     """
-    Return (now_temp, min_last_h, max_last_h) in last N hours (UTC window)
-    now_temp = latest datapoint <= now, or None if not found
+    NOW = latest datapoint <= now
+    MIN/MAX = last N hours in UTC window
     """
     if not series:
         return None, None, None
@@ -127,45 +204,52 @@ def last_hours_now_minmax(series, hours=8):
 
     past = [(dt, tf) for dt, tf in series if dt <= now]
     now_tf = float(past[-1][1]) if past else None
-
     return now_tf, mn, mx
 
 # ---------------- FETCHERS ----------------
 
-def fetch_open_meteo(horizon_hours=48):
+def fetch_open_meteo(lat, lon, horizon_hours=48):
     url = (
         "https://api.open-meteo.com/v1/forecast"
-        f"?latitude={LAT}&longitude={LON}"
+        f"?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m"
         "&temperature_unit=fahrenheit"
         "&timezone=UTC"
     )
     r = safe_get(url)
     if not r or r.status_code != 200:
-        return []
+        return [], None
+
     try:
         j = r.json()
+        tz_name = j.get("timezone")  # usually "GMT" since we requested UTC; keep for safety
         rows = []
         for t, tf in zip(j["hourly"]["time"], j["hourly"]["temperature_2m"]):
             dt = datetime.fromisoformat(t).replace(tzinfo=timezone.utc)
             if in_horizon(dt, horizon_hours):
                 rows.append((dt.isoformat(), float(tf)))
-        return rows
+        return rows, tz_name
     except Exception:
-        return []
+        return [], None
 
-def fetch_weather_gov(horizon_hours=48):
+def fetch_weather_gov(lat, lon, horizon_hours=48):
+    """
+    Only works in USA coverage; for non-covered points it will fail => [].
+    """
     headers = {"User-Agent": "WeatherEdge", "Accept": "application/geo+json"}
-    p = safe_get(f"https://api.weather.gov/points/{LAT},{LON}", headers=headers)
+    p = safe_get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers)
     if not p or p.status_code != 200:
         return []
+
     try:
         forecast_url = p.json()["properties"]["forecastHourly"]
     except Exception:
         return []
+
     r = safe_get(forecast_url, headers=headers)
     if not r or r.status_code != 200:
         return []
+
     try:
         periods = r.json()["properties"]["periods"]
         rows = []
@@ -177,14 +261,13 @@ def fetch_weather_gov(horizon_hours=48):
     except Exception:
         return []
 
-def fetch_tomorrow_io(horizon_hours=48):
-    # v4/timelines (stable)
+def fetch_tomorrow_io(lat, lon, horizon_hours=48):
     if not TOMORROW_KEY:
         return []
 
     url = "https://api.tomorrow.io/v4/timelines"
     payload = {
-        "location": f"{LAT},{LON}",
+        "location": f"{lat},{lon}",
         "fields": ["temperature"],
         "timesteps": ["1h"],
         "units": "imperial",
@@ -208,27 +291,20 @@ def fetch_tomorrow_io(horizon_hours=48):
     except Exception:
         return []
 
-# ---------------- KALSHI MARKET PRICE ----------------
+# ---------------- KALSHI MARKET (optional) ----------------
 
-def fetch_kalshi_yes_price(market_ticker: str) -> tuple[float | None, str | None]:
-    """
-    Public market data:
-      GET {base}/trade-api/v2/markets/{ticker}
-    Prefer YES ask (yes_ask_dollars). Fallback last_price_dollars.
-    Returns (price, field_used)
-    """
+def fetch_kalshi_yes_price(market_ticker: str):
     if not market_ticker:
         return None, None
 
     url = f"{KALSHI_BASE_URL}/trade-api/v2/markets/{market_ticker}"
-    r = safe_get(url, timeout=15, retries=3, backoff=1.8)
+    r = safe_get(url, timeout=15, retries=2)
     if not r or r.status_code != 200:
         return None, None
 
     try:
         j = r.json()
         m = j.get("market", {})
-
         if m.get("yes_ask_dollars") is not None:
             return float(m["yes_ask_dollars"]), "yes_ask_dollars"
         if m.get("last_price_dollars") is not None:
@@ -237,18 +313,11 @@ def fetch_kalshi_yes_price(market_ticker: str) -> tuple[float | None, str | None
     except Exception:
         return None, None
 
-def read_market_price() -> tuple[float, str, dict]:
-    """
-    Priority:
-      1) Kalshi (if KALSHI_MARKET_TICKER set and fetch works)
-      2) /app/market.json (legacy)
-      3) ENV MARKET_PRICE_YES_OVER_48
-    Returns (price, source, meta)
-    """
+def read_market_price():
     # 1) Kalshi
     p, used = fetch_kalshi_yes_price(KALSHI_MARKET_TICKER)
     if p is not None:
-        return p, "kalshi", {"ticker": KALSHI_MARKET_TICKER, "field": used, "base_url": KALSHI_BASE_URL}
+        return p, "kalshi", {"ticker": KALSHI_MARKET_TICKER, "field": used}
 
     # 2) local json
     try:
@@ -301,48 +370,63 @@ class SourceSummary:
 class RunResult:
     ok: bool
     generated_at_utc: str
+
+    location_name: str
+    timezone_name: str
     lat: float
     lon: float
-    ny_date_tomorrow: str
+    local_tomorrow_date: str
 
-    # Kalshi market info
-    kalshi_ticker: str
-    market_price: float | None
-    market_source: str
-    market_meta: dict
-
-    sources: list  # list[SourceSummary]
+    sources: list
     removed_outliers: list
     notes: list
 
-    # Consensus now & last 8h
     consensus_now_f: float | None
     consensus_last8h_min_f: float | None
     consensus_last8h_max_f: float | None
 
-    # Tomorrow consensus
     consensus_tmr_min_f: float | None
     consensus_tmr_max_f: float | None
 
-    # Betting
+    # betting
     threshold_f: float
     p_over: float | None
+    market_price: float | None
+    market_source: str
+    market_meta: dict
     edge: float | None
     stake: float | None
 
 # ---------------- RUNNER ----------------
 
-def run_once_struct() -> RunResult:
+def run_once_struct(q: str | None = None, lat: float | None = None, lon: float | None = None) -> RunResult:
+    lat0, lon0, loc_name, tz_guess = resolve_location(q, lat, lon)
+
+    # Determine local timezone
+    # If we got tz from geocode -> use it; else keep UTC
+    try:
+        local_tz = ZoneInfo(tz_guess) if tz_guess else ZoneInfo("UTC")
+        tz_name = local_tz.key
+    except Exception:
+        local_tz = ZoneInfo("UTC")
+        tz_name = "UTC"
+
     con = db()
     notes = []
 
-    inserts = {
-        "open_meteo": insert_rows(con, "open_meteo", fetch_open_meteo()),
-        "weather_gov": insert_rows(con, "weather_gov", fetch_weather_gov()),
-        "tomorrow_io": insert_rows(con, "tomorrow_io", fetch_tomorrow_io()),
-    }
+    # Fetch + insert
+    om_rows, _tz_from_om = fetch_open_meteo(lat0, lon0)
+    n1 = insert_rows(con, "open_meteo", lat0, lon0, om_rows)
 
-    by_source = load_recent(con, hours=6)
+    wg_rows = fetch_weather_gov(lat0, lon0)
+    n2 = insert_rows(con, "weather_gov", lat0, lon0, wg_rows)
+
+    tm_rows = fetch_tomorrow_io(lat0, lon0)
+    n3 = insert_rows(con, "tomorrow_io", lat0, lon0, tm_rows)
+
+    inserts = {"open_meteo": n1, "weather_gov": n2, "tomorrow_io": n3}
+
+    by_source = load_recent(con, lat0, lon0, hours=6)
 
     per_now = {}
     per_8h_min = {}
@@ -362,7 +446,7 @@ def run_once_struct() -> RunResult:
             status = "OK"
 
         now_f, mn8, mx8 = last_hours_now_minmax(series, hours=8)
-        tmin, tmax = day_minmax_ny(series, day_offset=1)
+        tmin, tmax = day_minmax_local(series, local_tz, day_offset=1)
 
         if now_f is not None:
             per_now[src] = now_f
@@ -390,7 +474,7 @@ def run_once_struct() -> RunResult:
 
     removed = []
 
-    # Consensus NOW + last 8h
+    # consensus NOW + 8h
     consensus_now = None
     consensus_8h_min = None
     consensus_8h_max = None
@@ -400,23 +484,23 @@ def run_once_struct() -> RunResult:
         removed = sorted(set(removed) | (set(per_now.keys()) - set(now_filtered.keys())))
         consensus_now = float(np.mean(list(now_filtered.values())))
     else:
-        notes.append("No NOW datapoints in last 6h cache.")
+        notes.append("No NOW datapoints (last 6h cache) for this location.")
 
     if per_8h_min:
         min_filtered = remove_outliers_iqr(per_8h_min)
         removed = sorted(set(removed) | (set(per_8h_min.keys()) - set(min_filtered.keys())))
         consensus_8h_min = float(np.mean(list(min_filtered.values())))
     else:
-        notes.append("No last-8h MIN values available.")
+        notes.append("No last-8h MIN values for this location.")
 
     if per_8h_max:
         max_filtered = remove_outliers_iqr(per_8h_max)
         removed = sorted(set(removed) | (set(per_8h_max.keys()) - set(max_filtered.keys())))
         consensus_8h_max = float(np.mean(list(max_filtered.values())))
     else:
-        notes.append("No last-8h MAX values available.")
+        notes.append("No last-8h MAX values for this location.")
 
-    # Tomorrow consensus
+    # tomorrow consensus
     consensus_tmr_min = consensus_tmr_max = None
     if per_tmr_min and per_tmr_max:
         tmr_min_filtered = remove_outliers_iqr(per_tmr_min)
@@ -427,17 +511,14 @@ def run_once_struct() -> RunResult:
         consensus_tmr_min = float(np.mean(list(tmr_min_filtered.values())))
         consensus_tmr_max = float(np.mean(list(tmr_max_filtered.values())))
     else:
-        notes.append("Not enough tomorrow (NY) data to compute consensus MIN/MAX.")
+        notes.append("Not enough tomorrow data to compute MIN/MAX consensus.")
 
-    # Market price from Kalshi (or fallback)
+    # market price (kalshi or fallback)
     market_price, market_source, market_meta = read_market_price()
-    if market_source == "kalshi" and not KALSHI_MARKET_TICKER:
-        notes.append("KALSHI_MARKET_TICKER is empty; cannot fetch Kalshi market.")
 
-    # Betting model (based on consensus tomorrow MAX)
+    # betting
     threshold = 48.0
     p_over = edge = stake = None
-
     if consensus_tmr_max is not None:
         vals = list(per_tmr_max.values())
         spread = float(np.std(vals)) if len(vals) > 1 else 2.0
@@ -447,22 +528,21 @@ def run_once_struct() -> RunResult:
         p_over = monte_carlo_prob_over(threshold, consensus_tmr_max, sigma_total)
         edge = p_over - market_price
         stake = fractional_kelly(p_over, market_price, fraction=0.25)
-    else:
-        notes.append("Skipped probability model because consensus_tmr_max is None.")
 
-    tomorrow_ny = (datetime.now(NY) + timedelta(days=1)).date().isoformat()
+    local_tomorrow = (datetime.now(local_tz) + timedelta(days=1)).date().isoformat()
+
+    # quick note why only 1 source appears in practice
+    notes.append(f"Inserted rows: open_meteo={n1}, weather_gov={n2}, tomorrow_io={n3}")
 
     return RunResult(
         ok=True,
         generated_at_utc=datetime.now(timezone.utc).isoformat(),
-        lat=LAT,
-        lon=LON,
-        ny_date_tomorrow=tomorrow_ny,
 
-        kalshi_ticker=KALSHI_MARKET_TICKER,
-        market_price=market_price,
-        market_source=market_source,
-        market_meta=market_meta,
+        location_name=loc_name,
+        timezone_name=tz_name,
+        lat=float(lat0),
+        lon=float(lon0),
+        local_tomorrow_date=local_tomorrow,
 
         sources=src_summaries,
         removed_outliers=removed,
@@ -477,19 +557,22 @@ def run_once_struct() -> RunResult:
 
         threshold_f=threshold,
         p_over=p_over,
+        market_price=market_price,
+        market_source=market_source,
+        market_meta=market_meta,
         edge=edge,
         stake=stake,
     )
 
-def run_once_text() -> str:
-    rr = run_once_struct()
+def run_once_text(q: str | None = None, lat: float | None = None, lon: float | None = None) -> str:
+    rr = run_once_struct(q=q, lat=lat, lon=lon)
     def ff(x): return "N/A" if x is None else f"{x:.1f}F"
 
     lines = []
     lines.append(f"Generated: {rr.generated_at_utc}")
-    lines.append(f"Location: {rr.lat},{rr.lon}")
-    lines.append(f"Tomorrow (NY): {rr.ny_date_tomorrow}")
-    lines.append(f"Market price source: {rr.market_source} | price: {rr.market_price:.4f} | ticker: {rr.kalshi_ticker or 'N/A'}")
+    lines.append(f"Location: {rr.location_name} ({rr.lat:.4f},{rr.lon:.4f}) TZ={rr.timezone_name}")
+    lines.append(f"Tomorrow (local): {rr.local_tomorrow_date}")
+    lines.append(f"Market: {rr.market_source} price={rr.market_price:.4f}")
 
     lines.append("\nNOW + last 8h:")
     lines.append(f"Consensus now/min/max: {ff(rr.consensus_now_f)} / {ff(rr.consensus_last8h_min_f)} / {ff(rr.consensus_last8h_max_f)}")
@@ -497,17 +580,11 @@ def run_once_text() -> str:
     for s in rr.sources:
         lines.append(f"\n[{s.src}] status={s.status} inserted={s.rows_inserted}")
         lines.append(f"Now / 8h MIN / 8h MAX: {ff(s.now_f)} / {ff(s.last8h_min_f)} / {ff(s.last8h_max_f)}")
-        lines.append(f"Tomorrow NY MIN/MAX: {ff(s.tmr_min_f)} / {ff(s.tmr_max_f)}")
-
-    if rr.consensus_tmr_min_f is not None and rr.consensus_tmr_max_f is not None:
-        lines.append(f"\nTomorrow consensus MIN/MAX: {ff(rr.consensus_tmr_min_f)} / {ff(rr.consensus_tmr_max_f)}")
-    else:
-        lines.append("\nTomorrow consensus MIN/MAX: N/A")
+        lines.append(f"Tomorrow MIN/MAX: {ff(s.tmr_min_f)} / {ff(s.tmr_max_f)}")
 
     if rr.p_over is not None:
-        lines.append(f"P(TMAX > {rr.threshold_f:.0f}F): {rr.p_over*100:.2f}%")
-        lines.append(f"Market YES: {rr.market_price*100:.2f}% | Edge: {rr.edge*100:.2f}%")
-        lines.append(f"Stake (25% Kelly): {rr.stake*100:.2f}%")
+        lines.append(f"\nP(TMAX > {rr.threshold_f:.0f}F): {rr.p_over*100:.2f}%")
+        lines.append(f"Edge: {(rr.edge*100):.2f}% | Stake(25% Kelly): {(rr.stake*100):.2f}%")
 
     if rr.removed_outliers:
         lines.append(f"\nOutliers removed: {rr.removed_outliers}")
