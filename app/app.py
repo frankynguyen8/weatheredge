@@ -1,4 +1,5 @@
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
@@ -8,14 +9,10 @@ from app.main import run_once_struct, run_once_text
 
 app = FastAPI()
 
-# cache in memory
-CACHE = {
-    "updated_at_utc": None,
-    "data": None,
-    "error": None,
-}
+CACHE = {"updated_at_utc": None, "data": None, "error": None}
 
-REFRESH_SECONDS = 30 * 60  # 30 minutes
+REFRESH_MINUTES = int(os.getenv("REFRESH_MINUTES", "30"))
+REFRESH_SECONDS = max(60, REFRESH_MINUTES * 60)  # minimum 60s
 
 
 def pct(x):
@@ -24,6 +21,14 @@ def pct(x):
 
 def fmt_f(x):
     return "N/A" if x is None else f"{x:.1f}°F"
+
+
+def badge_for_status(status: str):
+    if status == "OK":
+        return ("OK", "#22c55e")
+    if status == "NO_KEY":
+        return ("NO_KEY", "#f97316")
+    return ("EMPTY", "#94a3b8")
 
 
 async def refresh_loop():
@@ -40,7 +45,6 @@ async def refresh_loop():
 
 @app.on_event("startup")
 async def on_startup():
-    # run first refresh immediately + then loop
     try:
         data = run_once_struct()
         CACHE["data"] = data
@@ -59,7 +63,6 @@ def health():
 
 @app.get("/api/run", response_class=PlainTextResponse)
 def api_run():
-    # on-demand text (still safe)
     try:
         return run_once_text() + "\n"
     except Exception as e:
@@ -68,7 +71,6 @@ def api_run():
 
 @app.get("/api/latest.json")
 def latest_json():
-    # cached structured result
     if not CACHE["data"]:
         return JSONResponse({"ok": False, "error": CACHE["error"], "data": None}, status_code=200)
 
@@ -80,8 +82,14 @@ def latest_json():
         "lat": d.lat,
         "lon": d.lon,
         "ny_date_tomorrow": d.ny_date_tomorrow,
-        "consensus_min_f": d.consensus_min,
-        "consensus_max_f": d.consensus_max,
+
+        "consensus_now_f": d.consensus_now_f,
+        "consensus_last8h_min_f": d.consensus_last8h_min_f,
+        "consensus_last8h_max_f": d.consensus_last8h_max_f,
+
+        "consensus_tmr_min_f": d.consensus_tmr_min_f,
+        "consensus_tmr_max_f": d.consensus_tmr_max_f,
+
         "threshold_f": d.threshold_f,
         "p_over": d.p_over,
         "market_price": d.market_price,
@@ -89,13 +97,19 @@ def latest_json():
         "stake": d.stake,
         "removed_outliers": d.removed_outliers,
         "notes": d.notes,
+
         "sources": [
             {
                 "src": s.src,
+                "status": s.status,
                 "rows_inserted": s.rows_inserted,
-                "tomorrow_min_f": s.tmr_min,
-                "tomorrow_max_f": s.tmr_max,
-                "next_hours": s.next_hours,
+
+                "now_f": s.now_f,
+                "last8h_min_f": s.last8h_min_f,
+                "last8h_max_f": s.last8h_max_f,
+
+                "tomorrow_min_f": s.tmr_min_f,
+                "tomorrow_max_f": s.tmr_max_f,
             } for s in d.sources
         ],
     }
@@ -119,34 +133,43 @@ def home():
         </body></html>
         """
 
-    # badges
-    p_over = d.p_over
-    market = d.market_price
+    # status badge based on edge
     edge = d.edge
-    stake = d.stake
-
-    # choose simple status color
     status_color = "#22c55e" if (edge is not None and edge > 0) else "#f97316"
     status_text = "EDGE+" if (edge is not None and edge > 0) else "NO EDGE"
 
-    # build sources table
-    rows = ""
+    # Build NOW + last8h table
+    rows_now = ""
     for s in d.sources:
-        rows += f"""
+        label, color = badge_for_status(s.status)
+        rows_now += f"""
         <tr>
           <td class="td mono">{s.src}</td>
-          <td class="td mono">{s.rows_inserted}</td>
-          <td class="td">{fmt_f(s.tmr_min)}</td>
-          <td class="td">{fmt_f(s.tmr_max)}</td>
+          <td class="td"><span class="tag" style="border-color:{color};color:{color};">{label}</span></td>
+          <td class="td">{fmt_f(s.now_f)}</td>
+          <td class="td">{fmt_f(s.last8h_min_f)}</td>
+          <td class="td">{fmt_f(s.last8h_max_f)}</td>
         </tr>
         """
 
-    # notes
+    # Build tomorrow table
+    rows_tmr = ""
+    for s in d.sources:
+        label, color = badge_for_status(s.status)
+        rows_tmr += f"""
+        <tr>
+          <td class="td mono">{s.src}</td>
+          <td class="td"><span class="tag" style="border-color:{color};color:{color};">{label}</span></td>
+          <td class="td mono">{s.rows_inserted}</td>
+          <td class="td">{fmt_f(s.tmr_min_f)}</td>
+          <td class="td">{fmt_f(s.tmr_max_f)}</td>
+        </tr>
+        """
+
     notes_html = ""
     if d.notes:
         notes_html = "<ul class='notes'>" + "".join([f"<li>{n}</li>" for n in d.notes]) + "</ul>"
 
-    # auto refresh page every 30 minutes
     return f"""
     <html>
       <head>
@@ -164,7 +187,6 @@ def home():
             --blue: #7aa2ff;
             --green: #22c55e;
             --orange: #f97316;
-            --red: #ef4444;
             --shadow: 0 10px 30px rgba(0,0,0,.35);
             --radius: 18px;
           }}
@@ -177,22 +199,29 @@ def home():
             color: var(--text);
             font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
           }}
-          .wrap {{ max-width: 980px; margin: 0 auto; padding: 22px 16px 42px; }}
+          .wrap {{ max-width: 1020px; margin: 0 auto; padding: 22px 16px 42px; }}
           .top {{
             display:flex; align-items:flex-end; justify-content:space-between; gap:12px;
             margin-bottom: 14px;
           }}
-          h1 {{ margin:0; font-size: 28px; letter-spacing: .2px; }}
+          h1 {{ margin:0; font-size: 28px; }}
           .sub {{ color: var(--muted); font-size: 13px; margin-top: 6px; }}
           .pill {{
-            display:inline-flex; align-items:center; gap:8px;
+            display:inline-flex; align-items:center; gap:10px;
             padding: 8px 12px; border-radius: 999px;
             background: rgba(255,255,255,.06);
             border: 1px solid var(--border);
             color: var(--muted);
             font-size: 13px;
           }}
-          .pill strong {{ color: var(--text); }}
+          .badge {{
+            padding: 6px 10px;
+            border-radius: 999px;
+            border: 1px solid rgba(255,255,255,.14);
+            background: rgba(255,255,255,.06);
+            font-size: 12px;
+            color: var(--text);
+          }}
           .grid {{
             display:grid;
             grid-template-columns: repeat(12, 1fr);
@@ -221,31 +250,12 @@ def home():
             min-width: 220px;
           }}
           .metric .label {{ color: var(--muted); font-size: 12px; }}
-          .metric .value {{ font-size: 22px; font-weight: 800; letter-spacing: .2px; }}
+          .metric .value {{ font-size: 22px; font-weight: 800; }}
           .metric .hint {{ color: var(--muted); font-size: 12px; }}
-          .badge {{
-            padding: 6px 10px;
-            border-radius: 999px;
-            border: 1px solid rgba(255,255,255,.14);
-            background: rgba(255,255,255,.06);
-            font-size: 12px;
-            color: var(--text);
-          }}
-          .badge.status {{
-            border-color: rgba(255,255,255,.14);
-            background: rgba(255,255,255,.06);
-          }}
-          table {{
-            width: 100%;
-            border-collapse: collapse;
-            overflow: hidden;
-            border-radius: 14px;
-          }}
+          table {{ width: 100%; border-collapse: collapse; border-radius: 14px; overflow: hidden; }}
           .th {{
-            text-align:left;
-            padding: 10px 10px;
-            color: var(--muted);
-            font-size: 12px;
+            text-align:left; padding: 10px 10px;
+            color: var(--muted); font-size: 12px;
             border-bottom: 1px solid rgba(255,255,255,.10);
           }}
           .td {{
@@ -254,6 +264,13 @@ def home():
             font-size: 13px;
           }}
           .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+          .tag {{
+            display:inline-flex; align-items:center; justify-content:center;
+            padding: 4px 10px; border-radius: 999px;
+            border: 1px solid rgba(255,255,255,.16);
+            background: rgba(255,255,255,.04);
+            font-size: 12px;
+          }}
           .notes {{ margin: 10px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }}
           .links a {{ color: var(--blue); text-decoration:none; }}
           .links a:hover {{ text-decoration: underline; }}
@@ -279,25 +296,41 @@ def home():
               </div>
             </div>
             <div class="pill">
-              <span class="badge status" style="border-color:{status_color}; color:{status_color};">{status_text}</span>
-              <span>Auto refresh: <strong>30m</strong></span>
+              <span class="badge" style="border-color:{status_color}; color:{status_color};">{status_text}</span>
+              <span>Auto refresh: <strong>{REFRESH_MINUTES}m</strong></span>
             </div>
           </div>
 
           <div class="grid">
             <div class="card one">
-              <h2>Tomorrow (NY) MIN / MAX (Consensus)</h2>
+              <h2>NOW + Last 8 Hours</h2>
               <div class="big">
                 <div class="metric">
-                  <div class="label">Consensus MIN</div>
-                  <div class="value">{fmt_f(d.consensus_min)}</div>
-                  <div class="hint">Avg after outlier filter</div>
+                  <div class="label">Consensus NOW</div>
+                  <div class="value">{fmt_f(d.consensus_now_f)}</div>
+                  <div class="hint">Latest datapoint ≤ now</div>
                 </div>
                 <div class="metric">
-                  <div class="label">Consensus MAX</div>
-                  <div class="value">{fmt_f(d.consensus_max)}</div>
-                  <div class="hint">Avg after outlier filter</div>
+                  <div class="label">Consensus 8h MIN / MAX</div>
+                  <div class="value">{fmt_f(d.consensus_last8h_min_f)} / {fmt_f(d.consensus_last8h_max_f)}</div>
+                  <div class="hint">Window: last 8 hours (UTC)</div>
                 </div>
+              </div>
+              <div style="margin-top:12px;">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="th">Source</th>
+                      <th class="th">Status</th>
+                      <th class="th">NOW</th>
+                      <th class="th">8h MIN</th>
+                      <th class="th">8h MAX</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows_now}
+                  </tbody>
+                </table>
               </div>
             </div>
 
@@ -308,30 +341,39 @@ def home():
                   <div class="label">P(TMAX &gt; {d.threshold_f:.0f}°F)</div>
                   <div class="value">{("N/A" if d.p_over is None else f"{pct(d.p_over):.2f}%")}</div>
                   <div class="hint">
-                    Market: {("N/A" if market is None else f"{pct(market):.2f}%")}
-                    · Edge: {("N/A" if edge is None else f"{pct(edge):.2f}%")}
-                    · Stake(25% Kelly): {("N/A" if stake is None else f"{pct(stake):.2f}%")}
+                    Market: {("N/A" if d.market_price is None else f"{pct(d.market_price):.2f}%")}
+                    · Edge: {("N/A" if d.edge is None else f"{pct(d.edge):.2f}%")}
+                    · Stake(25% Kelly): {("N/A" if d.stake is None else f"{pct(d.stake):.2f}%")}
                   </div>
                 </div>
               </div>
             </div>
 
             <div class="card">
-              <h2>Sources (Tomorrow NY MIN/MAX)</h2>
-              <table>
-                <thead>
-                  <tr>
-                    <th class="th">Source</th>
-                    <th class="th">Inserted</th>
-                    <th class="th">Tomorrow MIN</th>
-                    <th class="th">Tomorrow MAX</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows}
-                </tbody>
-              </table>
+              <h2>Tomorrow (NY) MIN / MAX (Sources)</h2>
+              <div style="margin-top:6px;">
+                <table>
+                  <thead>
+                    <tr>
+                      <th class="th">Source</th>
+                      <th class="th">Status</th>
+                      <th class="th">Inserted</th>
+                      <th class="th">Tomorrow MIN</th>
+                      <th class="th">Tomorrow MAX</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows_tmr}
+                  </tbody>
+                </table>
+              </div>
+
               <div class="sub" style="margin-top:10px;">
+                Tomorrow consensus MIN/MAX:
+                <strong>{fmt_f(d.consensus_tmr_min_f)} / {fmt_f(d.consensus_tmr_max_f)}</strong>
+              </div>
+
+              <div class="sub" style="margin-top:6px;">
                 Outliers removed: <span class="mono">{d.removed_outliers or "[]"}</span>
               </div>
               {notes_html}
@@ -345,7 +387,7 @@ def home():
                 <a href="/health">/health</a>
               </div>
               <div class="sub" style="margin-top:8px;">
-                Trang tự reload mỗi 30 phút. Background cũng refresh cache mỗi 30 phút.
+                Trang tự reload theo REFRESH_MINUTES. Background cũng refresh cache theo REFRESH_MINUTES.
               </div>
             </div>
           </div>
