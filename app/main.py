@@ -2,6 +2,7 @@ import os
 import json
 import time
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -15,44 +16,30 @@ NY = ZoneInfo("America/New_York")
 DB_PATH = os.getenv("DB_PATH", "/var/data/weatheredge.sqlite")
 TOMORROW_KEY = os.getenv("TOMORROW_KEY", "")
 
-# -------------------- HTTP SAFE GET --------------------
+# --------- HTTP safe get ---------
 
-def safe_get(url: str, headers=None, timeout=15, retries=3, backoff=1.5):
-    """
-    - Retry 429, 5xx, network errors
-    - Return Response or None (never raise)
-    """
+def safe_get(url: str, headers=None, timeout=15, retries=3, backoff=1.8):
     headers = headers or {}
-    last_err = None
-
     for i in range(retries):
         try:
             r = requests.get(url, headers=headers, timeout=timeout)
 
-            # 429 Too Many Requests
-            if r.status_code == 429:
-                time.sleep(backoff * (i + 1))
-                continue
-
-            # 5xx server errors
-            if 500 <= r.status_code <= 599:
+            if r.status_code == 429 or (500 <= r.status_code <= 599):
                 time.sleep(backoff * (i + 1))
                 continue
 
             return r
-        except requests.RequestException as e:
-            last_err = e
+        except requests.RequestException:
             time.sleep(backoff * (i + 1))
-
     return None
 
-# -------------------- DB --------------------
+# --------- DB ---------
 
 def db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
-        CREATE TABLE IF NOT EXISTS hourly_forecast (
+        CREATE TABLE IF NOT EXISTS hourly_forecast(
             source TEXT,
             time_utc TEXT,
             temp_f REAL,
@@ -86,28 +73,34 @@ def load_recent(con, hours=6):
         by_source[src].sort(key=lambda x: x[0])
     return by_source
 
-# -------------------- TIME HELPERS --------------------
+# --------- time helpers ---------
 
-def horizon_filter(dt: datetime, horizon_hours=48):
+def in_horizon(dt: datetime, horizon_hours=48):
     now = datetime.now(timezone.utc)
     end = now + timedelta(hours=horizon_hours)
     return now <= dt <= end
 
-def next_n_hours(series, n=18):
+def next_n_hours(series, n=10):
     now = datetime.now(timezone.utc)
     out = [(dt, tf) for dt, tf in series if dt >= now]
     return out[:n]
 
-def max_temp_tomorrow_ny(series):
-    target = (datetime.now(NY) + timedelta(days=1)).date()
-    mx = None
+def day_minmax_ny(series, day_offset=1):
+    """
+    day_offset=1 => tomorrow in NY
+    Returns (min,max) in Fahrenheit or (None,None)
+    """
+    target = (datetime.now(NY) + timedelta(days=day_offset)).date()
+    vals = []
     for dt_utc, tf in series:
         dt_ny = dt_utc.astimezone(NY)
         if dt_ny.date() == target:
-            mx = tf if mx is None else max(mx, tf)
-    return mx
+            vals.append(float(tf))
+    if not vals:
+        return None, None
+    return float(min(vals)), float(max(vals))
 
-# -------------------- FETCHERS (SAFE) --------------------
+# --------- fetchers ---------
 
 def fetch_open_meteo(horizon_hours=48):
     url = (
@@ -117,7 +110,7 @@ def fetch_open_meteo(horizon_hours=48):
         "&temperature_unit=fahrenheit"
         "&timezone=UTC"
     )
-    r = safe_get(url, timeout=15, retries=3, backoff=1.8)
+    r = safe_get(url)
     if not r:
         return []
 
@@ -126,19 +119,15 @@ def fetch_open_meteo(horizon_hours=48):
         rows = []
         for t, tf in zip(j["hourly"]["time"], j["hourly"]["temperature_2m"]):
             dt = datetime.fromisoformat(t).replace(tzinfo=timezone.utc)
-            if horizon_filter(dt, horizon_hours):
+            if in_horizon(dt, horizon_hours):
                 rows.append((dt.isoformat(), float(tf)))
         return rows
     except Exception:
         return []
 
 def fetch_weather_gov(horizon_hours=48):
-    headers = {
-        "User-Agent": "WeatherEdge (contact: long22nguyenhuu@icloud.com)",
-        "Accept": "application/geo+json",
-    }
-
-    p = safe_get(f"https://api.weather.gov/points/{LAT},{LON}", headers=headers, timeout=15, retries=3)
+    headers = {"User-Agent": "WeatherEdge", "Accept": "application/geo+json"}
+    p = safe_get(f"https://api.weather.gov/points/{LAT},{LON}", headers=headers)
     if not p:
         return []
 
@@ -147,7 +136,7 @@ def fetch_weather_gov(horizon_hours=48):
     except Exception:
         return []
 
-    r = safe_get(forecast_url, headers=headers, timeout=15, retries=3)
+    r = safe_get(forecast_url, headers=headers)
     if not r:
         return []
 
@@ -156,7 +145,7 @@ def fetch_weather_gov(horizon_hours=48):
         rows = []
         for it in periods:
             dt = datetime.fromisoformat(it["startTime"]).astimezone(timezone.utc)
-            if horizon_filter(dt, horizon_hours):
+            if in_horizon(dt, horizon_hours):
                 rows.append((dt.isoformat(), float(it["temperature"])))
         return rows
     except Exception:
@@ -174,8 +163,7 @@ def fetch_tomorrow_io(horizon_hours=48):
         "&units=imperial"
         f"&apikey={TOMORROW_KEY}"
     )
-
-    r = safe_get(url, timeout=15, retries=3, backoff=1.8)
+    r = safe_get(url)
     if not r:
         return []
 
@@ -184,13 +172,13 @@ def fetch_tomorrow_io(horizon_hours=48):
         rows = []
         for it in j["timelines"]["hourly"]:
             dt = datetime.fromisoformat(it["time"].replace("Z", "+00:00")).astimezone(timezone.utc)
-            if horizon_filter(dt, horizon_hours):
+            if in_horizon(dt, horizon_hours):
                 rows.append((dt.isoformat(), float(it["values"]["temperature"])))
         return rows
     except Exception:
         return []
 
-# -------------------- CONSENSUS + BETTING --------------------
+# --------- stats & betting ---------
 
 def remove_outliers_iqr(values_dict):
     vals = np.array(list(values_dict.values()), dtype=float)
@@ -201,24 +189,6 @@ def remove_outliers_iqr(values_dict):
     lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
     filtered = {k: v for k, v in values_dict.items() if lo <= v <= hi}
     return filtered if len(filtered) >= 2 else values_dict
-
-def consensus_tomorrow_max(by_source):
-    per = {}
-    for src, series in by_source.items():
-        mx = max_temp_tomorrow_ny(series)
-        if mx is not None:
-            per[src] = mx
-
-    if not per:
-        return None, None, None, None
-
-    per_filtered = remove_outliers_iqr(per)
-    removed = sorted(set(per.keys()) - set(per_filtered.keys()))
-
-    vals = list(per_filtered.values())
-    mean = float(np.mean(vals))
-    spread = float(np.std(vals)) if len(vals) > 1 else 2.0
-    return mean, spread, per, removed
 
 def monte_carlo_prob_over(threshold_f, mean_f, sigma_f, sims=30000, seed=7):
     rng = np.random.default_rng(seed)
@@ -239,62 +209,159 @@ def fractional_kelly(p, price, fraction=0.25):
     raw = (p - price) / (1 - price)
     return max(0.0, raw) * fraction
 
-# -------------------- RUN --------------------
+# --------- result model ---------
 
-def run_once() -> str:
-    lines = []
+@dataclass
+class SourceSummary:
+    src: str
+    rows_inserted: int
+    next_hours: list  # list[(dt_iso, temp)]
+    tmr_min: float | None
+    tmr_max: float | None
+
+@dataclass
+class RunResult:
+    ok: bool
+    generated_at_utc: str
+    lat: float
+    lon: float
+    ny_date_tomorrow: str
+    sources: list  # list[SourceSummary]
+    consensus_min: float | None
+    consensus_max: float | None
+    removed_outliers: list
+    threshold_f: float
+    p_over: float | None
+    market_price: float | None
+    edge: float | None
+    stake: float | None
+    notes: list
+
+# --------- main runner ---------
+
+def run_once_struct() -> RunResult:
     con = db()
+    notes = []
 
-    # Fetch (never crash)
-    n1 = insert_rows(con, "open_meteo", fetch_open_meteo())
-    n2 = insert_rows(con, "weather_gov", fetch_weather_gov())
-    n3 = insert_rows(con, "tomorrow_io", fetch_tomorrow_io())
-
-    lines.append(f"Inserted rows: open_meteo={n1}, weather_gov={n2}, tomorrow_io={n3}")
+    inserts = {
+        "open_meteo": insert_rows(con, "open_meteo", fetch_open_meteo()),
+        "weather_gov": insert_rows(con, "weather_gov", fetch_weather_gov()),
+        "tomorrow_io": insert_rows(con, "tomorrow_io", fetch_tomorrow_io()),
+    }
 
     by_source = load_recent(con, hours=6)
-    lines.append(f"Sources available: {sorted(by_source.keys())}")
 
-    # Optional: show next few hours (keep short)
+    src_summaries = []
+    per_min = {}
+    per_max = {}
+
     for src, series in by_source.items():
-        nxt = next_n_hours(series, 8)
-        if nxt:
-            lines.append(f"\n{src} next hours (UTC):")
-            for dt, tf in nxt:
-                lines.append(f"  {dt.isoformat()}  {tf:.1f}F")
+        nxt = [(dt.isoformat(), float(tf)) for dt, tf in next_n_hours(series, 10)]
+        tmin, tmax = day_minmax_ny(series, day_offset=1)
 
-    mean, sigma, per, removed = consensus_tomorrow_max(by_source)
-    if mean is None:
-        lines.append("\nNo tomorrow data within horizon (providers may be rate-limiting).")
-        return "\n".join(lines)
+        src_summaries.append(
+            SourceSummary(
+                src=src,
+                rows_inserted=inserts.get(src, 0),
+                next_hours=nxt,
+                tmr_min=tmin,
+                tmr_max=tmax
+            )
+        )
 
-    lines.append("\nTomorrow (NY) max per source:")
-    for src, mx in per.items():
-        lines.append(f"  {src}: {mx:.2f}F")
-    if removed:
-        lines.append(f"Outliers removed: {removed}")
+        if tmin is not None and tmax is not None:
+            per_min[src] = tmin
+            per_max[src] = tmax
 
-    base_sigma = 2.0
-    sigma_total = float(np.sqrt(base_sigma**2 + sigma**2))
+    # consensus min/max (outlier filter on both)
+    consensus_min = consensus_max = None
+    removed = []
 
+    if per_min and per_max:
+        min_filtered = remove_outliers_iqr(per_min)
+        max_filtered = remove_outliers_iqr(per_max)
+
+        removed = sorted(set(per_min.keys()) - set(min_filtered.keys()) |
+                         set(per_max.keys()) - set(max_filtered.keys()))
+
+        consensus_min = float(np.mean(list(min_filtered.values())))
+        consensus_max = float(np.mean(list(max_filtered.values())))
+    else:
+        notes.append("Not enough tomorrow (NY) data to compute MIN/MAX consensus.")
+
+    # probability model (use consensus_max as tmax mean)
     threshold = 48.0
-    p_over = monte_carlo_prob_over(threshold, mean, sigma_total)
+    p_over = market = edge = stake = None
 
-    market_price = read_market_price()
-    edge = p_over - market_price
-    kelly = fractional_kelly(p_over, market_price, fraction=0.25)
+    if consensus_max is not None:
+        # spread from sources (std of max), plus base sigma
+        vals = list(per_max.values())
+        spread = float(np.std(vals)) if len(vals) > 1 else 2.0
+        base_sigma = 2.0
+        sigma_total = float(np.sqrt(base_sigma**2 + spread**2))
 
-    lines.append(f"\nConsensus tomorrow max (NY): {mean:.2f}F")
-    lines.append(f"Total sigma: {sigma_total:.2f}F")
-    lines.append(f"P(TMAX > {threshold:.0f}F): {p_over*100:.2f}%")
-    lines.append(f"Market YES: {market_price*100:.2f}% | Edge: {edge*100:.2f}%")
-    lines.append(f"Stake (25% Kelly): {kelly*100:.2f}% of bankroll")
+        p_over = monte_carlo_prob_over(threshold, consensus_max, sigma_total)
+        market = read_market_price()
+        edge = p_over - market
+        stake = fractional_kelly(p_over, market, fraction=0.25)
+    else:
+        notes.append("Skipped probability model because consensus_max is None.")
+
+    tomorrow_ny = (datetime.now(NY) + timedelta(days=1)).date().isoformat()
+
+    return RunResult(
+        ok=True,
+        generated_at_utc=datetime.now(timezone.utc).isoformat(),
+        lat=LAT,
+        lon=LON,
+        ny_date_tomorrow=tomorrow_ny,
+        sources=src_summaries,
+        consensus_min=consensus_min,
+        consensus_max=consensus_max,
+        removed_outliers=removed,
+        threshold_f=threshold,
+        p_over=p_over,
+        market_price=market,
+        edge=edge,
+        stake=stake,
+        notes=notes
+    )
+
+def run_once_text() -> str:
+    # Keep a compact text output for /api/run
+    rr = run_once_struct()
+    lines = []
+    lines.append(f"Generated: {rr.generated_at_utc}")
+    lines.append(f"Location: {rr.lat},{rr.lon}")
+    lines.append(f"Tomorrow (NY): {rr.ny_date_tomorrow}")
+
+    for s in rr.sources:
+        lines.append(f"\n[{s.src}] inserted={s.rows_inserted}")
+        if s.tmr_min is not None and s.tmr_max is not None:
+            lines.append(f"Tomorrow MIN/MAX: {s.tmr_min:.1f}F / {s.tmr_max:.1f}F")
+        else:
+            lines.append("Tomorrow MIN/MAX: N/A")
+
+    if rr.consensus_min is not None and rr.consensus_max is not None:
+        lines.append(f"\nConsensus MIN/MAX: {rr.consensus_min:.1f}F / {rr.consensus_max:.1f}F")
+    else:
+        lines.append("\nConsensus MIN/MAX: N/A")
+
+    if rr.p_over is not None:
+        lines.append(f"P(TMAX > {rr.threshold_f:.0f}F): {rr.p_over*100:.2f}%")
+        lines.append(f"Market YES: {rr.market_price*100:.2f}% | Edge: {rr.edge*100:.2f}%")
+        lines.append(f"Stake (25% Kelly): {rr.stake*100:.2f}%")
+    else:
+        lines.append("Model probability: N/A")
+
+    if rr.removed_outliers:
+        lines.append(f"Outliers removed: {rr.removed_outliers}")
+
+    if rr.notes:
+        lines.append("\nNotes:")
+        lines.extend([f"- {x}" for x in rr.notes])
 
     return "\n".join(lines)
 
-def run_once_text() -> str:
-    # helper for API
-    return run_once()
-
 if __name__ == "__main__":
-    print(run_once())
+    print(run_once_text())
