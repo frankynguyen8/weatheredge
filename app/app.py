@@ -11,14 +11,7 @@ def health():
 
 @app.get("/api/run")
 def run_once():
-    # chạy script hiện tại của bạn (main.py) 1 lần và trả output
-    #p = subprocess.run(["python", "main.py"], capture_output=True, text=True)
-   # return {
-    #    "ok": p.returncode == 0,
-     #   "code": p.returncode,
-     #   "stdout": p.stdout[-5000:],  # tránh quá dài
-     #   "stderr": p.stderr[-5000:],
-   # }
+
 from app.main import run_once_text
 
 @app.get("/api/run")
