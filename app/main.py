@@ -9,16 +9,22 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import requests
 
+# ---------------- CONFIG ----------------
+
 LAT = float(os.getenv("LAT", "40.78858"))
 LON = float(os.getenv("LON", "-73.9661"))
 NY = ZoneInfo("America/New_York")
 
 DB_PATH = os.getenv("DB_PATH", "/var/data/weatheredge.sqlite")
-TOMORROW_KEY = os.getenv("TOMORROW_KEY", "")
+TOMORROW_KEY = os.getenv("TOMORROW_KEY", "").strip()
+
+# Kalshi (market data)
+KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER", "").strip()
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
 
 EXPECTED_SOURCES = ["open_meteo", "weather_gov", "tomorrow_io"]
 
-# -------------------- HTTP safe get --------------------
+# ---------------- HTTP (safe) ----------------
 
 def safe_get(url: str, headers=None, timeout=15, retries=3, backoff=1.8):
     headers = headers or {}
@@ -46,7 +52,7 @@ def safe_post(url: str, headers=None, json_body=None, timeout=15, retries=3, bac
             time.sleep(backoff * (i + 1))
     return None
 
-# -------------------- DB --------------------
+# ---------------- DB ----------------
 
 def db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -86,17 +92,12 @@ def load_recent(con, hours=6):
         by_source[src].sort(key=lambda x: x[0])
     return by_source
 
-# -------------------- time helpers --------------------
+# ---------------- TIME HELPERS ----------------
 
 def in_horizon(dt: datetime, horizon_hours=48):
     now = datetime.now(timezone.utc)
     end = now + timedelta(hours=horizon_hours)
     return now <= dt <= end
-
-def next_n_hours(series, n=10):
-    now = datetime.now(timezone.utc)
-    out = [(dt, tf) for dt, tf in series if dt >= now]
-    return out[:n]
 
 def day_minmax_ny(series, day_offset=1):
     target = (datetime.now(NY) + timedelta(days=day_offset)).date()
@@ -120,18 +121,16 @@ def last_hours_now_minmax(series, hours=8):
     now = datetime.now(timezone.utc)
     start = now - timedelta(hours=hours)
 
-    # min/max within last hours
     window_vals = [tf for dt, tf in series if start <= dt <= now]
     mn = float(min(window_vals)) if window_vals else None
     mx = float(max(window_vals)) if window_vals else None
 
-    # "now" = latest value <= now
     past = [(dt, tf) for dt, tf in series if dt <= now]
     now_tf = float(past[-1][1]) if past else None
 
     return now_tf, mn, mx
 
-# -------------------- fetchers --------------------
+# ---------------- FETCHERS ----------------
 
 def fetch_open_meteo(horizon_hours=48):
     url = (
@@ -179,7 +178,7 @@ def fetch_weather_gov(horizon_hours=48):
         return []
 
 def fetch_tomorrow_io(horizon_hours=48):
-    # Use v4/timelines (recommended)
+    # v4/timelines (stable)
     if not TOMORROW_KEY:
         return []
 
@@ -209,7 +208,60 @@ def fetch_tomorrow_io(horizon_hours=48):
     except Exception:
         return []
 
-# -------------------- stats & betting --------------------
+# ---------------- KALSHI MARKET PRICE ----------------
+
+def fetch_kalshi_yes_price(market_ticker: str) -> tuple[float | None, str | None]:
+    """
+    Public market data:
+      GET {base}/trade-api/v2/markets/{ticker}
+    Prefer YES ask (yes_ask_dollars). Fallback last_price_dollars.
+    Returns (price, field_used)
+    """
+    if not market_ticker:
+        return None, None
+
+    url = f"{KALSHI_BASE_URL}/trade-api/v2/markets/{market_ticker}"
+    r = safe_get(url, timeout=15, retries=3, backoff=1.8)
+    if not r or r.status_code != 200:
+        return None, None
+
+    try:
+        j = r.json()
+        m = j.get("market", {})
+
+        if m.get("yes_ask_dollars") is not None:
+            return float(m["yes_ask_dollars"]), "yes_ask_dollars"
+        if m.get("last_price_dollars") is not None:
+            return float(m["last_price_dollars"]), "last_price_dollars"
+        return None, None
+    except Exception:
+        return None, None
+
+def read_market_price() -> tuple[float, str, dict]:
+    """
+    Priority:
+      1) Kalshi (if KALSHI_MARKET_TICKER set and fetch works)
+      2) /app/market.json (legacy)
+      3) ENV MARKET_PRICE_YES_OVER_48
+    Returns (price, source, meta)
+    """
+    # 1) Kalshi
+    p, used = fetch_kalshi_yes_price(KALSHI_MARKET_TICKER)
+    if p is not None:
+        return p, "kalshi", {"ticker": KALSHI_MARKET_TICKER, "field": used, "base_url": KALSHI_BASE_URL}
+
+    # 2) local json
+    try:
+        with open("/app/market.json", "r", encoding="utf-8") as f:
+            j = json.load(f)
+        return float(j["market_price_yes_over_48"]), "local_json", {"path": "/app/market.json"}
+    except Exception:
+        pass
+
+    # 3) env fallback
+    return float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17")), "env_fallback", {"env": "MARKET_PRICE_YES_OVER_48"}
+
+# ---------------- STATS & BETTING ----------------
 
 def remove_outliers_iqr(values_dict):
     vals = np.array(list(values_dict.values()), dtype=float)
@@ -226,21 +278,13 @@ def monte_carlo_prob_over(threshold_f, mean_f, sigma_f, sims=30000, seed=7):
     draws = rng.normal(loc=mean_f, scale=max(0.1, sigma_f), size=sims)
     return float(np.mean(draws > threshold_f))
 
-def read_market_price():
-    try:
-        with open("/app/market.json", "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return float(j["market_price_yes_over_48"])
-    except Exception:
-        return float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17"))
-
 def fractional_kelly(p, price, fraction=0.25):
     if not (0 < price < 1):
         return 0.0
     raw = (p - price) / (1 - price)
     return max(0.0, raw) * fraction
 
-# -------------------- result model --------------------
+# ---------------- MODELS ----------------
 
 @dataclass
 class SourceSummary:
@@ -259,8 +303,13 @@ class RunResult:
     generated_at_utc: str
     lat: float
     lon: float
-
     ny_date_tomorrow: str
+
+    # Kalshi market info
+    kalshi_ticker: str
+    market_price: float | None
+    market_source: str
+    market_meta: dict
 
     sources: list  # list[SourceSummary]
     removed_outliers: list
@@ -278,11 +327,10 @@ class RunResult:
     # Betting
     threshold_f: float
     p_over: float | None
-    market_price: float | None
     edge: float | None
     stake: float | None
 
-# -------------------- main runner --------------------
+# ---------------- RUNNER ----------------
 
 def run_once_struct() -> RunResult:
     con = db()
@@ -296,7 +344,6 @@ def run_once_struct() -> RunResult:
 
     by_source = load_recent(con, hours=6)
 
-    # per-source now/8h + tomorrow
     per_now = {}
     per_8h_min = {}
     per_8h_max = {}
@@ -307,11 +354,12 @@ def run_once_struct() -> RunResult:
 
     for src in EXPECTED_SOURCES:
         series = by_source.get(src, [])
-        status = "OK"
         if src == "tomorrow_io" and not TOMORROW_KEY:
             status = "NO_KEY"
         elif not series:
             status = "EMPTY"
+        else:
+            status = "OK"
 
         now_f, mn8, mx8 = last_hours_now_minmax(series, hours=8)
         tmin, tmax = day_minmax_ny(series, day_offset=1)
@@ -342,42 +390,53 @@ def run_once_struct() -> RunResult:
 
     removed = []
 
-    # Consensus now + last 8h (simple mean with outlier filter when enough)
+    # Consensus NOW + last 8h
     consensus_now = None
     consensus_8h_min = None
     consensus_8h_max = None
 
     if per_now:
-        per_now_f = remove_outliers_iqr(per_now)
-        removed = sorted(set(removed) | (set(per_now.keys()) - set(per_now_f.keys())))
-        consensus_now = float(np.mean(list(per_now_f.values())))
+        now_filtered = remove_outliers_iqr(per_now)
+        removed = sorted(set(removed) | (set(per_now.keys()) - set(now_filtered.keys())))
+        consensus_now = float(np.mean(list(now_filtered.values())))
+    else:
+        notes.append("No NOW datapoints in last 6h cache.")
 
     if per_8h_min:
-        per_min_f = remove_outliers_iqr(per_8h_min)
-        removed = sorted(set(removed) | (set(per_8h_min.keys()) - set(per_min_f.keys())))
-        consensus_8h_min = float(np.mean(list(per_min_f.values())))
+        min_filtered = remove_outliers_iqr(per_8h_min)
+        removed = sorted(set(removed) | (set(per_8h_min.keys()) - set(min_filtered.keys())))
+        consensus_8h_min = float(np.mean(list(min_filtered.values())))
+    else:
+        notes.append("No last-8h MIN values available.")
 
     if per_8h_max:
-        per_max_f = remove_outliers_iqr(per_8h_max)
-        removed = sorted(set(removed) | (set(per_8h_max.keys()) - set(per_max_f.keys())))
-        consensus_8h_max = float(np.mean(list(per_max_f.values())))
+        max_filtered = remove_outliers_iqr(per_8h_max)
+        removed = sorted(set(removed) | (set(per_8h_max.keys()) - set(max_filtered.keys())))
+        consensus_8h_max = float(np.mean(list(max_filtered.values())))
+    else:
+        notes.append("No last-8h MAX values available.")
 
-    # Tomorrow consensus min/max
+    # Tomorrow consensus
     consensus_tmr_min = consensus_tmr_max = None
     if per_tmr_min and per_tmr_max:
-        tmr_min_f = remove_outliers_iqr(per_tmr_min)
-        tmr_max_f = remove_outliers_iqr(per_tmr_max)
+        tmr_min_filtered = remove_outliers_iqr(per_tmr_min)
+        tmr_max_filtered = remove_outliers_iqr(per_tmr_max)
         removed = sorted(set(removed) |
-                         (set(per_tmr_min.keys()) - set(tmr_min_f.keys())) |
-                         (set(per_tmr_max.keys()) - set(tmr_max_f.keys())))
-        consensus_tmr_min = float(np.mean(list(tmr_min_f.values())))
-        consensus_tmr_max = float(np.mean(list(tmr_max_f.values())))
+                         (set(per_tmr_min.keys()) - set(tmr_min_filtered.keys())) |
+                         (set(per_tmr_max.keys()) - set(tmr_max_filtered.keys())))
+        consensus_tmr_min = float(np.mean(list(tmr_min_filtered.values())))
+        consensus_tmr_max = float(np.mean(list(tmr_max_filtered.values())))
     else:
         notes.append("Not enough tomorrow (NY) data to compute consensus MIN/MAX.")
 
-    # Betting model based on consensus tomorrow MAX
+    # Market price from Kalshi (or fallback)
+    market_price, market_source, market_meta = read_market_price()
+    if market_source == "kalshi" and not KALSHI_MARKET_TICKER:
+        notes.append("KALSHI_MARKET_TICKER is empty; cannot fetch Kalshi market.")
+
+    # Betting model (based on consensus tomorrow MAX)
     threshold = 48.0
-    p_over = market = edge = stake = None
+    p_over = edge = stake = None
 
     if consensus_tmr_max is not None:
         vals = list(per_tmr_max.values())
@@ -386,9 +445,8 @@ def run_once_struct() -> RunResult:
         sigma_total = float(np.sqrt(base_sigma**2 + spread**2))
 
         p_over = monte_carlo_prob_over(threshold, consensus_tmr_max, sigma_total)
-        market = read_market_price()
-        edge = p_over - market
-        stake = fractional_kelly(p_over, market, fraction=0.25)
+        edge = p_over - market_price
+        stake = fractional_kelly(p_over, market_price, fraction=0.25)
     else:
         notes.append("Skipped probability model because consensus_tmr_max is None.")
 
@@ -400,6 +458,11 @@ def run_once_struct() -> RunResult:
         lat=LAT,
         lon=LON,
         ny_date_tomorrow=tomorrow_ny,
+
+        kalshi_ticker=KALSHI_MARKET_TICKER,
+        market_price=market_price,
+        market_source=market_source,
+        market_meta=market_meta,
 
         sources=src_summaries,
         removed_outliers=removed,
@@ -414,7 +477,6 @@ def run_once_struct() -> RunResult:
 
         threshold_f=threshold,
         p_over=p_over,
-        market_price=market,
         edge=edge,
         stake=stake,
     )
@@ -427,6 +489,7 @@ def run_once_text() -> str:
     lines.append(f"Generated: {rr.generated_at_utc}")
     lines.append(f"Location: {rr.lat},{rr.lon}")
     lines.append(f"Tomorrow (NY): {rr.ny_date_tomorrow}")
+    lines.append(f"Market price source: {rr.market_source} | price: {rr.market_price:.4f} | ticker: {rr.kalshi_ticker or 'N/A'}")
 
     lines.append("\nNOW + last 8h:")
     lines.append(f"Consensus now/min/max: {ff(rr.consensus_now_f)} / {ff(rr.consensus_last8h_min_f)} / {ff(rr.consensus_last8h_max_f)}")
