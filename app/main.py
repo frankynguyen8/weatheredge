@@ -1,19 +1,24 @@
-import sqlite3, json, time, argparse
+import os
+import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
-import requests
-import numpy as np
 from zoneinfo import ZoneInfo
 
-LAT = 40.78858
-LON = -73.9661
+import numpy as np
+import requests
+
+LAT = float(os.getenv("LAT", "40.78858"))
+LON = float(os.getenv("LON", "-73.9661"))
 NY = ZoneInfo("America/New_York")
 
-TOMORROW_KEY = "iqAjw2K5LNqSOLQfBbYASQ1izFV51xjy"
-import os
+# DB on Render Disk
 DB_PATH = os.getenv("DB_PATH", "/var/data/weatheredge.sqlite")
 
+# Tomorrow.io key -> nên để ở Environment Variables trên Render
+TOMORROW_KEY = os.getenv("TOMORROW_KEY", "")
+
 def db():
-    # ✅ Ensure folder exists (Render Disk)
+    # Ensure folder exists (Render Disk)
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     con.execute("""
@@ -28,6 +33,8 @@ def db():
     return con
 
 def insert_rows(con, source, rows):
+    if not rows:
+        return
     fetched = datetime.now(timezone.utc).isoformat()
     con.executemany(
         "INSERT INTO hourly_forecast(source,time_utc,temp_f,fetched_at_utc) VALUES (?,?,?,?)",
@@ -71,7 +78,10 @@ def fetch_open_meteo(horizon_hours=48):
     return rows
 
 def fetch_weather_gov(horizon_hours=48):
-    headers = {"User-Agent": "WeatherEdge (long22nguyenhuu@icloud.com)", "Accept":"application/geo+json"}
+    headers = {
+        "User-Agent": "WeatherEdge (contact: long22nguyenhuu@icloud.com)",
+        "Accept": "application/geo+json",
+    }
     p = requests.get(f"https://api.weather.gov/points/{LAT},{LON}", headers=headers, timeout=20)
     p.raise_for_status()
     forecast_url = p.json()["properties"]["forecastHourly"]
@@ -91,8 +101,7 @@ def fetch_weather_gov(horizon_hours=48):
     return rows
 
 def fetch_tomorrow_io(horizon_hours=48):
-    if TOMORROW_KEY.startswith("PUT_"):
-        print("Tomorrow.io key not set -> skipping Tomorrow.io.")
+    if not TOMORROW_KEY:
         return []
 
     url = (
@@ -145,7 +154,7 @@ def remove_outliers_iqr(values_dict):
     iqr = q3 - q1
     lo = q1 - 1.5 * iqr
     hi = q3 + 1.5 * iqr
-    filtered = {k:v for k,v in values_dict.items() if lo <= v <= hi}
+    filtered = {k: v for k, v in values_dict.items() if lo <= v <= hi}
     return filtered if len(filtered) >= 2 else values_dict
 
 def consensus_tomorrow_max(by_source):
@@ -171,12 +180,13 @@ def monte_carlo_prob_over(threshold_f, mean_f, sigma_f, sims=50000, seed=7):
     return float(np.mean(draws > threshold_f))
 
 def read_market_price():
+    # optional local file; if missing -> fallback
     try:
-        with open("/app/market.json","r",encoding="utf-8") as f:
+        with open("/app/market.json", "r", encoding="utf-8") as f:
             j = json.load(f)
         return float(j["market_price_yes_over_48"])
     except Exception:
-        return 0.17
+        return float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17"))
 
 def fractional_kelly(p, price, fraction=0.25):
     if price <= 0 or price >= 1:
@@ -184,9 +194,8 @@ def fractional_kelly(p, price, fraction=0.25):
     raw = (p - price) / (1 - price)
     return max(0.0, raw) * fraction
 
-def run_once():
+def run_once() -> str:
     lines = []
-
     con = db()
 
     lines.append("Fetching Open-Meteo...")
@@ -238,31 +247,9 @@ def run_once():
 
     return "\n".join(lines)
 
+# helper cho API
 def run_once_text() -> str:
-    import io
-    from contextlib import redirect_stdout
+    return run_once()
 
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        run_once()
-    return buf.getvalue()
-
-def main():
-    run_once()
-
-def home():
-    return "WeatherEdge is running! Try /api/run"
-
-def api_run():
-    try:
-        out = run_once()   # run_once() phải trả về string output
-
-        # Nếu muốn JSON thì thêm ?format=json
-        if request.args.get("format") == "json":
-            return jsonify(ok=True, output=out.splitlines())
-
-        # Mặc định trả text/plain để đọc đẹp
-        return Response(out + "\n", mimetype="text/plain; charset=utf-8")
-
-    except Exception as e:
-        return jsonify(ok=False, error=str(e))
+if __name__ == "__main__":
+    print(run_once())
