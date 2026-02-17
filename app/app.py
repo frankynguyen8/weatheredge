@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
-from app.main import run_once_text
+from main import run_once_text
 
 app = FastAPI()
 
