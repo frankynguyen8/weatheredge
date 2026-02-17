@@ -12,16 +12,13 @@ app = FastAPI()
 CACHE = {"updated_at_utc": None, "data": None, "error": None}
 
 REFRESH_MINUTES = int(os.getenv("REFRESH_MINUTES", "30"))
-REFRESH_SECONDS = max(60, REFRESH_MINUTES * 60)  # minimum 60s
-
+REFRESH_SECONDS = max(60, REFRESH_MINUTES * 60)
 
 def pct(x):
     return None if x is None else round(x * 100, 2)
 
-
 def fmt_f(x):
     return "N/A" if x is None else f"{x:.1f}°F"
-
 
 def badge_for_status(status: str):
     if status == "OK":
@@ -29,7 +26,6 @@ def badge_for_status(status: str):
     if status == "NO_KEY":
         return ("NO_KEY", "#f97316")
     return ("EMPTY", "#94a3b8")
-
 
 async def refresh_loop():
     while True:
@@ -42,7 +38,6 @@ async def refresh_loop():
             CACHE["error"] = str(e)
         await asyncio.sleep(REFRESH_SECONDS)
 
-
 @app.on_event("startup")
 async def on_startup():
     try:
@@ -52,14 +47,11 @@ async def on_startup():
         CACHE["error"] = None
     except Exception as e:
         CACHE["error"] = str(e)
-
     asyncio.create_task(refresh_loop())
-
 
 @app.get("/health")
 def health():
     return {"ok": True, "cache_updated_at_utc": CACHE["updated_at_utc"], "error": CACHE["error"]}
-
 
 @app.get("/api/run", response_class=PlainTextResponse)
 def api_run():
@@ -67,7 +59,6 @@ def api_run():
         return run_once_text() + "\n"
     except Exception as e:
         return PlainTextResponse(f"Service degraded: {e}\n", status_code=200)
-
 
 @app.get("/api/latest.json")
 def latest_json():
@@ -83,6 +74,11 @@ def latest_json():
         "lon": d.lon,
         "ny_date_tomorrow": d.ny_date_tomorrow,
 
+        "kalshi_ticker": d.kalshi_ticker,
+        "market_price": d.market_price,
+        "market_source": d.market_source,
+        "market_meta": d.market_meta,
+
         "consensus_now_f": d.consensus_now_f,
         "consensus_last8h_min_f": d.consensus_last8h_min_f,
         "consensus_last8h_max_f": d.consensus_last8h_max_f,
@@ -92,9 +88,9 @@ def latest_json():
 
         "threshold_f": d.threshold_f,
         "p_over": d.p_over,
-        "market_price": d.market_price,
         "edge": d.edge,
         "stake": d.stake,
+
         "removed_outliers": d.removed_outliers,
         "notes": d.notes,
 
@@ -103,17 +99,14 @@ def latest_json():
                 "src": s.src,
                 "status": s.status,
                 "rows_inserted": s.rows_inserted,
-
                 "now_f": s.now_f,
                 "last8h_min_f": s.last8h_min_f,
                 "last8h_max_f": s.last8h_max_f,
-
                 "tomorrow_min_f": s.tmr_min_f,
                 "tomorrow_max_f": s.tmr_max_f,
             } for s in d.sources
         ],
     }
-
 
 @app.get("/", response_class=HTMLResponse)
 def home():
@@ -133,12 +126,12 @@ def home():
         </body></html>
         """
 
-    # status badge based on edge
+    # status badge
     edge = d.edge
     status_color = "#22c55e" if (edge is not None and edge > 0) else "#f97316"
     status_text = "EDGE+" if (edge is not None and edge > 0) else "NO EDGE"
 
-    # Build NOW + last8h table
+    # tables
     rows_now = ""
     for s in d.sources:
         label, color = badge_for_status(s.status)
@@ -152,7 +145,6 @@ def home():
         </tr>
         """
 
-    # Build tomorrow table
     rows_tmr = ""
     for s in d.sources:
         label, color = badge_for_status(s.status)
@@ -170,6 +162,10 @@ def home():
     if d.notes:
         notes_html = "<ul class='notes'>" + "".join([f"<li>{n}</li>" for n in d.notes]) + "</ul>"
 
+    market_line = f"{d.market_source} · {d.market_price*100:.2f}%"
+    if d.market_source == "kalshi":
+        market_line += f" · ticker: {d.kalshi_ticker or 'N/A'}"
+
     return f"""
     <html>
       <head>
@@ -179,14 +175,10 @@ def home():
         <style>
           :root {{
             --bg: #0b1020;
-            --panel: #0f1730;
-            --card: #121a33;
             --text: #eaeefc;
             --muted: rgba(234,238,252,.72);
             --border: rgba(255,255,255,.10);
             --blue: #7aa2ff;
-            --green: #22c55e;
-            --orange: #f97316;
             --shadow: 0 10px 30px rgba(0,0,0,.35);
             --radius: 18px;
           }}
@@ -200,12 +192,10 @@ def home():
             font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial;
           }}
           .wrap {{ max-width: 1020px; margin: 0 auto; padding: 22px 16px 42px; }}
-          .top {{
-            display:flex; align-items:flex-end; justify-content:space-between; gap:12px;
-            margin-bottom: 14px;
-          }}
+          .top {{ display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom: 14px; }}
           h1 {{ margin:0; font-size: 28px; }}
           .sub {{ color: var(--muted); font-size: 13px; margin-top: 6px; }}
+          .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
           .pill {{
             display:inline-flex; align-items:center; gap:10px;
             padding: 8px 12px; border-radius: 999px;
@@ -237,10 +227,7 @@ def home():
             padding: 14px 14px;
           }}
           .card h2 {{ margin: 0 0 10px; font-size: 16px; color: var(--muted); font-weight: 600; }}
-          .big {{
-            display:flex; align-items:baseline; justify-content:space-between; gap: 12px;
-            flex-wrap: wrap;
-          }}
+          .big {{ display:flex; align-items:baseline; justify-content:space-between; gap: 12px; flex-wrap: wrap; }}
           .metric {{
             display:flex; flex-direction:column; gap:6px;
             padding: 10px 12px;
@@ -253,17 +240,8 @@ def home():
           .metric .value {{ font-size: 22px; font-weight: 800; }}
           .metric .hint {{ color: var(--muted); font-size: 12px; }}
           table {{ width: 100%; border-collapse: collapse; border-radius: 14px; overflow: hidden; }}
-          .th {{
-            text-align:left; padding: 10px 10px;
-            color: var(--muted); font-size: 12px;
-            border-bottom: 1px solid rgba(255,255,255,.10);
-          }}
-          .td {{
-            padding: 10px 10px;
-            border-bottom: 1px solid rgba(255,255,255,.06);
-            font-size: 13px;
-          }}
-          .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+          .th {{ text-align:left; padding: 10px 10px; color: var(--muted); font-size: 12px; border-bottom: 1px solid rgba(255,255,255,.10); }}
+          .td {{ padding: 10px 10px; border-bottom: 1px solid rgba(255,255,255,.06); font-size: 13px; }}
           .tag {{
             display:inline-flex; align-items:center; justify-content:center;
             padding: 4px 10px; border-radius: 999px;
@@ -293,6 +271,9 @@ def home():
               <div class="sub">
                 Cache updated (UTC): <span class="mono">{updated}</span>
                 · Generated (UTC): <span class="mono">{d.generated_at_utc}</span>
+              </div>
+              <div class="sub">
+                Market: <span class="mono">{market_line}</span>
               </div>
             </div>
             <div class="pill">
@@ -341,7 +322,7 @@ def home():
                   <div class="label">P(TMAX &gt; {d.threshold_f:.0f}°F)</div>
                   <div class="value">{("N/A" if d.p_over is None else f"{pct(d.p_over):.2f}%")}</div>
                   <div class="hint">
-                    Market: {("N/A" if d.market_price is None else f"{pct(d.market_price):.2f}%")}
+                    Market: {f"{d.market_price*100:.2f}%" if d.market_price is not None else "N/A"}
                     · Edge: {("N/A" if d.edge is None else f"{pct(d.edge):.2f}%")}
                     · Stake(25% Kelly): {("N/A" if d.stake is None else f"{pct(d.stake):.2f}%")}
                   </div>
@@ -387,7 +368,7 @@ def home():
                 <a href="/health">/health</a>
               </div>
               <div class="sub" style="margin-top:8px;">
-                Trang tự reload theo REFRESH_MINUTES. Background cũng refresh cache theo REFRESH_MINUTES.
+                Trang auto reload theo REFRESH_MINUTES. Background cũng refresh cache theo REFRESH_MINUTES.
               </div>
             </div>
           </div>
