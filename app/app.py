@@ -11,11 +11,13 @@ def health():
 
 @app.get("/api/run")
 def api_run():
+    # Luôn trả text; không để provider lỗi làm sập endpoint
     try:
         out = run_once_text()
         return PlainTextResponse(out + "\n")
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        # vẫn trả 200 để không bị coi là service down
+        return PlainTextResponse(f"Service degraded: {e}\n", status_code=200)
 
 @app.get("/api/run.json")
 def api_run_json():
@@ -23,7 +25,8 @@ def api_run_json():
         out = run_once_text()
         return {"ok": True, "output": out.splitlines()}
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        # vẫn trả 200; ok=False để client biết degraded
+        return JSONResponse({"ok": False, "error": str(e), "output": []}, status_code=200)
 
 @app.get("/", response_class=HTMLResponse)
 def home():
