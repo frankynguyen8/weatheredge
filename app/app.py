@@ -3,9 +3,9 @@ import time
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, PlainTextResponse, JSONResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
-from app.main import run_once_struct, run_once_text, geocode_us
+from app.main import run_once_struct, run_once_text, geocode_us, kalshi_search_series
 
 app = FastAPI()
 
@@ -66,7 +66,6 @@ def api_run(q: str = None, lat: float = None, lon: float = None):
     try:
         return run_once_text(q=q, lat=lat, lon=lon) + "\n"
     except Exception as e:
-        # tránh 500
         return PlainTextResponse(f"ERROR: {e}\n", status_code=200)
 
 @app.get("/api/latest.json")
@@ -120,6 +119,20 @@ def api_latest(q: str = None, lat: float = None, lon: float = None):
         ],
     }
 
+@app.get("/api/kalshi/search")
+def api_kalshi_search(q: str = Query(..., min_length=2), limit: int = 10):
+    series, err = kalshi_search_series(q, limit=limit)
+    if err:
+        return {"ok": False, "error": err}
+
+    out = []
+    for s in series:
+        out.append({
+            "ticker": s.get("ticker") or s.get("series_ticker") or s.get("id"),
+            "title": s.get("title") or s.get("name") or s.get("question") or s.get("subtitle"),
+        })
+    return {"ok": True, "results": out}
+
 @app.get("/", response_class=HTMLResponse)
 def home(q: str = None, lat: float = None, lon: float = None):
     d, key, hit, err = get_cached(q=q, lat=lat, lon=lon)
@@ -148,7 +161,6 @@ def home(q: str = None, lat: float = None, lon: float = None):
         </body></html>
         """
 
-    # Build rows
     rows_now = ""
     for s in d.sources:
         label, color = badge_for_status(s.status)
@@ -174,6 +186,27 @@ def home(q: str = None, lat: float = None, lon: float = None):
           <td class="td">{fmt_f(s.tmr_max_f)}</td>
         </tr>
         """
+
+    market_card = f"""
+    <div class="card">
+      <h2 style="margin:0 0 8px;color:var(--muted);font-size:16px;">Market (Kalshi)</h2>
+      <div class="sub">
+        Source: <strong>{d.market_source}</strong>
+        · YES Price: <strong>{(d.market_price*100):.2f}%</strong>
+      </div>
+      <div class="sub" style="margin-top:6px;">
+        P(TMAX &gt; 48F): <strong>{pct(d.p_over) if d.p_over is not None else "N/A"}</strong>
+        · Edge: <strong>{pct(d.edge) if d.edge is not None else "N/A"}</strong>
+        · Stake: <strong>{pct(d.stake) if d.stake is not None else "N/A"}</strong>
+      </div>
+      <div class="sub" style="margin-top:6px;">
+        Meta: <span class="mono">{str(d.market_meta)}</span>
+      </div>
+      <div class="sub" style="margin-top:6px;">
+        Find ticker: <span class="mono">/api/kalshi/search?q=KXHIGHNY</span>
+      </div>
+    </div>
+    """
 
     return f"""
     <html>
@@ -232,6 +265,8 @@ def home(q: str = None, lat: float = None, lon: float = None):
               <tbody>{rows_now}</tbody>
             </table>
           </div>
+
+          {market_card}
 
           <div class="card">
             <h2 style="margin:0 0 8px;color:var(--muted);font-size:16px;">Tomorrow (Local) MIN / MAX</h2>
