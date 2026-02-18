@@ -2,11 +2,18 @@ import os
 import json
 import time
 import sqlite3
+import argparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
+
+# ================= OPTIONAL PANDAS =================
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 # ================= CONFIG =================
 
@@ -24,6 +31,7 @@ KALSHI_ACCESS_KEY = os.getenv("KALSHI_ACCESS_KEY", "").strip()
 KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
 KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER", "").strip()
 
+
 # ================= HTTP SAFE =================
 
 def safe_get(url, headers=None, timeout=15, retries=3, backoff=1.8):
@@ -39,6 +47,7 @@ def safe_get(url, headers=None, timeout=15, retries=3, backoff=1.8):
             time.sleep(backoff * (i + 1))
     return None
 
+
 def safe_post(url, headers=None, json_body=None, timeout=15, retries=3, backoff=1.8):
     headers = headers or {}
     for i in range(retries):
@@ -52,11 +61,13 @@ def safe_post(url, headers=None, json_body=None, timeout=15, retries=3, backoff=
             time.sleep(backoff * (i + 1))
     return None
 
+
 # ================= SIMPLE STATS (NO NUMPY) =================
 
 def mean(xs):
     xs = list(xs)
     return (sum(xs) / len(xs)) if xs else None
+
 
 def stdev(xs):
     xs = list(xs)
@@ -66,6 +77,7 @@ def stdev(xs):
     m = sum(xs) / n
     var = sum((x - m) ** 2 for x in xs) / (n - 1)
     return var ** 0.5
+
 
 def quantile(sorted_xs, q):
     n = len(sorted_xs)
@@ -78,6 +90,7 @@ def quantile(sorted_xs, q):
     hi = min(lo + 1, n - 1)
     frac = pos - lo
     return float(sorted_xs[lo] * (1 - frac) + sorted_xs[hi] * frac)
+
 
 def remove_outliers_iqr(values_dict):
     if not values_dict or len(values_dict) < 3:
@@ -95,6 +108,7 @@ def remove_outliers_iqr(values_dict):
     filtered = {k: v for k, v in values_dict.items() if lo <= float(v) <= hi}
     return filtered if len(filtered) >= 2 else values_dict
 
+
 def monte_carlo_prob_over(threshold_f, mean_f, sigma_f, sims=20000, seed=7):
     import random, math
     random.seed(seed)
@@ -109,6 +123,7 @@ def monte_carlo_prob_over(threshold_f, mean_f, sigma_f, sims=20000, seed=7):
             count += 1
     return count / sims
 
+
 def fractional_kelly(p, price, fraction=0.25):
     if p is None or price is None:
         return 0.0
@@ -116,6 +131,7 @@ def fractional_kelly(p, price, fraction=0.25):
         return 0.0
     raw = (p - price) / (1 - price)
     return max(0.0, raw) * fraction
+
 
 # ================= GEO (USA) =================
 
@@ -148,6 +164,7 @@ def geocode_us(query, count=5):
     except Exception:
         return []
 
+
 def safe_zoneinfo(tz_name):
     try:
         if tz_name:
@@ -157,6 +174,7 @@ def safe_zoneinfo(tz_name):
         pass
     tz = ZoneInfo("UTC")
     return tz, "UTC"
+
 
 def resolve_location(q=None, lat=None, lon=None):
     if lat is not None and lon is not None:
@@ -175,11 +193,13 @@ def resolve_location(q=None, lat=None, lon=None):
 
     return DEFAULT_LAT, DEFAULT_LON, f"{DEFAULT_LAT:.4f},{DEFAULT_LON:.4f}", "UTC"
 
+
 # ================= DB (MIGRATION SAFE) =================
 
 def table_columns(con, table):
     cur = con.execute(f"PRAGMA table_info({table})")
     return [row[1] for row in cur.fetchall()]
+
 
 def migrate_schema(con):
     cols = set(table_columns(con, "hourly_forecast"))
@@ -212,11 +232,13 @@ def migrate_schema(con):
     )
     con.commit()
 
+
 def db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     con = sqlite3.connect(DB_PATH)
     migrate_schema(con)
     return con
+
 
 def insert_rows(con, source, lat, lon, rows):
     if not rows:
@@ -228,6 +250,7 @@ def insert_rows(con, source, lat, lon, rows):
     )
     con.commit()
     return len(rows)
+
 
 def load_recent(con, lat, lon, hours=6):
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
@@ -249,12 +272,14 @@ def load_recent(con, lat, lon, hours=6):
         by_source[src].sort(key=lambda x: x[0])
     return by_source
 
+
 # ================= TIME HELPERS =================
 
 def in_horizon(dt, horizon_hours=48):
     now = datetime.now(timezone.utc)
     end = now + timedelta(hours=horizon_hours)
     return now <= dt <= end
+
 
 def last_hours_now_minmax(series, hours=8):
     if not series:
@@ -268,6 +293,7 @@ def last_hours_now_minmax(series, hours=8):
     now_tf = past[-1][1] if past else None
     return now_tf, mn, mx
 
+
 def day_minmax_local(series, local_tz, day_offset=1):
     target = (datetime.now(local_tz) + timedelta(days=day_offset)).date()
     vals = []
@@ -277,6 +303,7 @@ def day_minmax_local(series, local_tz, day_offset=1):
     if not vals:
         return None, None
     return min(vals), max(vals)
+
 
 # ================= WEATHER FETCHERS =================
 
@@ -301,6 +328,7 @@ def fetch_open_meteo(lat, lon, horizon_hours=48):
         return rows
     except Exception:
         return []
+
 
 def fetch_weather_gov(lat, lon, horizon_hours=48):
     headers = {
@@ -329,7 +357,11 @@ def fetch_weather_gov(lat, lon, horizon_hours=48):
     except Exception:
         return []
 
-def fetch_tomorrow_io(lat, lon, horizon_hours=48):
+
+def fetch_tomorrow_io_timelines(lat, lon, horizon_hours=48):
+    """
+    Tomorrow.io Timelines API (POST /v4/timelines) - lấy forecast theo giờ.
+    """
     if not TOMORROW_KEY:
         return []
     url = "https://api.tomorrow.io/v4/timelines"
@@ -356,16 +388,147 @@ def fetch_tomorrow_io(lat, lon, horizon_hours=48):
     except Exception:
         return []
 
+
+def fetch_tomorrow_io_forecast_daily(lat, lon, location_text=None, units="imperial", timesteps=("1d",)):
+    """
+    Tomorrow.io Weather Forecast API (GET /v4/weather/forecast)
+    - Mẫu gốc bạn đưa là JS dùng querystring: apikey, location, units, timesteps. :contentReference[oaicite:3]{index=3}
+    - Ở đây dùng requests.get.
+    """
+    if not TOMORROW_KEY:
+        return None, "Missing TOMORROW_KEY"
+
+    base_url = "https://api.tomorrow.io/v4/weather/forecast"
+    loc = location_text.strip() if location_text else f"{lat},{lon}"
+
+    params = {
+        "apikey": TOMORROW_KEY,
+        "location": loc,
+        "units": units,
+        "timesteps": ",".join(list(timesteps)),
+    }
+    headers = {"accept": "application/json"}
+
+    r = safe_get(base_url, headers=headers, timeout=20, retries=3)
+    # safe_get không nhận params, nên build URL thủ công:
+    if r is None:
+        # thử lại theo cách đúng với params
+        try:
+            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+        except Exception as e:
+            return None, str(e)
+    else:
+        # Nếu safe_get gọi base_url không có params thì sai; ta gọi lại đúng:
+        try:
+            r = requests.get(base_url, params=params, headers=headers, timeout=20)
+        except Exception as e:
+            return None, str(e)
+
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:300]}"
+
+    try:
+        data = r.json()
+        daily = (data.get("timelines") or {}).get("daily") or []
+        # Trả về list dict: time + temperatureMin/Max/Avg nếu có
+        out = []
+        for d in daily:
+            values = d.get("values") or {}
+            out.append({
+                "time": d.get("time"),
+                "temperatureMax": values.get("temperatureMax"),
+                "temperatureMin": values.get("temperatureMin"),
+                "temperatureAvg": values.get("temperatureAvg"),
+            })
+        return out, None
+    except Exception as e:
+        return None, str(e)
+
+
+def fetch_tomorrow_io_historical_df(
+    location,
+    fields=("temperature", "humidity"),
+    timesteps=("1h",),
+    start_time="nowMinus30d",
+    end_time="nowMinus15d",
+):
+    """
+    Tomorrow.io Historical API (POST /v4/historical) + Pandas DataFrame. :contentReference[oaicite:4]{index=4}
+    """
+    if not TOMORROW_KEY:
+        return None, "Missing TOMORROW_KEY"
+    if pd is None:
+        return None, "pandas is not installed. Install: pip install pandas"
+
+    url = f"https://api.tomorrow.io/v4/historical?apikey={TOMORROW_KEY}"
+    payload = {
+        "location": location,
+        "fields": list(fields),
+        "timesteps": list(timesteps),
+        "startTime": start_time,
+        "endTime": end_time,
+    }
+    headers = {
+        "accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "content-type": "application/json",
+    }
+
+    r = safe_post(url, headers=headers, json_body=payload, timeout=30, retries=3)
+    if not r:
+        return None, "No response"
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:300]}"
+
+    try:
+        j = r.json()
+        timelines = j["data"]["timelines"]
+        if not timelines:
+            return pd.DataFrame(), None
+        timeline = timelines[0]
+        df = pd.DataFrame(timeline["intervals"])
+        # flatten values
+        df = pd.concat([df.drop(["values"], axis=1), df["values"].apply(pd.Series)], axis=1)
+        return df, None
+    except Exception as e:
+        return None, str(e)
+
+
+def summarize_historical_df(df):
+    """
+    Một phân tích đơn giản: stats theo cột numeric.
+    """
+    if pd is None:
+        return None
+    if df is None or df.empty:
+        return {"rows": 0, "summary": {}}
+    numeric_cols = [c for c in df.columns if c not in ("time",) and pd.api.types.is_numeric_dtype(df[c])]
+    summary = {}
+    for c in numeric_cols:
+        s = df[c].dropna()
+        if len(s) == 0:
+            continue
+        summary[c] = {
+            "count": int(s.count()),
+            "mean": float(s.mean()),
+            "min": float(s.min()),
+            "max": float(s.max()),
+            "p50": float(s.quantile(0.50)),
+            "p90": float(s.quantile(0.90)),
+        }
+    return {"rows": int(len(df)), "summary": summary}
+
+
 # ================= KALSHI READ-ONLY (NO RSA) =================
 
 def kalshi_headers_readonly():
     h = {"Accept": "application/json"}
     if KALSHI_ACCESS_KEY:
-        # many environments accept this
         h["KALSHI-ACCESS-KEY"] = KALSHI_ACCESS_KEY
         # if your environment requires bearer, enable:
         # h["Authorization"] = f"Bearer {KALSHI_ACCESS_KEY}"
     return h
+
 
 def kalshi_get_readonly(path: str):
     url = KALSHI_BASE_URL + path
@@ -379,19 +542,12 @@ def kalshi_get_readonly(path: str):
     except Exception as e:
         return None, str(e)
 
-def kalshi_search_series(q: str, limit: int = 10):
-    q = (q or "").strip()
-    if not q:
-        return [], None
-    data, err = kalshi_get_readonly(f"/trade-api/v2/series?search={requests.utils.quote(q)}&limit={limit}")
-    if err:
-        return [], err
-    return (data.get("series") or []), None
 
 def kalshi_get_market(ticker: str):
     if not ticker:
         return None, "Missing ticker"
     return kalshi_get_readonly(f"/trade-api/v2/markets/{ticker}")
+
 
 def extract_yes_price_dollars(market_obj: dict):
     if not market_obj:
@@ -416,6 +572,7 @@ def extract_yes_price_dollars(market_obj: dict):
 
     return None, None
 
+
 def fetch_kalshi_yes_price(ticker: str):
     data, err = kalshi_get_market(ticker)
     if err:
@@ -424,6 +581,7 @@ def fetch_kalshi_yes_price(ticker: str):
     if price is None:
         return None, None, "No YES price fields in response"
     return price, field, None
+
 
 def read_market_price():
     if KALSHI_MARKET_TICKER:
@@ -435,6 +593,7 @@ def read_market_price():
 
     fallback = float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17"))
     return fallback, "env_fallback", {"env": "MARKET_PRICE_YES_OVER_48", "kalshi_error": "Missing KALSHI_MARKET_TICKER"}
+
 
 # ================= MODELS =================
 
@@ -448,6 +607,7 @@ class SourceSummary:
     last8h_max_f: float | None
     tmr_min_f: float | None
     tmr_max_f: float | None
+
 
 @dataclass
 class RunResult:
@@ -479,18 +639,37 @@ class RunResult:
     edge: float | None
     stake: float | None
 
+    # added: forecast daily + historical analysis
+    tomorrow_forecast_daily: list[dict] | None
+    historical_summary: dict | None
+    historical_csv_path: str | None
+
+
 # ================= RUN =================
 
-def run_once_struct(q=None, lat=None, lon=None) -> RunResult:
+def run_once_struct(
+    q=None,
+    lat=None,
+    lon=None,
+    threshold_f=48.0,
+    include_forecast_daily=True,
+    include_historical=False,
+    historical_start="nowMinus30d",
+    historical_end="nowMinus15d",
+    historical_fields=("temperature", "humidity"),
+    historical_timesteps=("1h",),
+    historical_csv_dir=".",
+) -> RunResult:
     lat0, lon0, loc_name, tz_guess = resolve_location(q, lat, lon)
     local_tz, tz_name = safe_zoneinfo(tz_guess)
 
     con = db()
     notes = []
 
+    # hourly forecast sources
     n1 = insert_rows(con, "open_meteo", lat0, lon0, fetch_open_meteo(lat0, lon0))
     n2 = insert_rows(con, "weather_gov", lat0, lon0, fetch_weather_gov(lat0, lon0))
-    n3 = insert_rows(con, "tomorrow_io", lat0, lon0, fetch_tomorrow_io(lat0, lon0))
+    n3 = insert_rows(con, "tomorrow_io", lat0, lon0, fetch_tomorrow_io_timelines(lat0, lon0))
 
     by_source = load_recent(con, lat0, lon0, hours=6)
 
@@ -510,11 +689,16 @@ def run_once_struct(q=None, lat=None, lon=None) -> RunResult:
         now_f, mn8, mx8 = last_hours_now_minmax(series, hours=8)
         tmin, tmax = day_minmax_local(series, local_tz, day_offset=1)
 
-        if now_f is not None: per_now[src] = now_f
-        if mn8 is not None: per_min8[src] = mn8
-        if mx8 is not None: per_max8[src] = mx8
-        if tmin is not None: per_tmr_min[src] = tmin
-        if tmax is not None: per_tmr_max[src] = tmax
+        if now_f is not None:
+            per_now[src] = now_f
+        if mn8 is not None:
+            per_min8[src] = mn8
+        if mx8 is not None:
+            per_max8[src] = mx8
+        if tmin is not None:
+            per_tmr_min[src] = tmin
+        if tmax is not None:
+            per_tmr_max[src] = tmax
 
         inserted = {"open_meteo": n1, "weather_gov": n2, "tomorrow_io": n3}.get(src, 0)
 
@@ -545,12 +729,11 @@ def run_once_struct(q=None, lat=None, lon=None) -> RunResult:
 
     market_price, market_source, market_meta = read_market_price()
 
-    threshold = 48.0
     p_over = edge = stake = None
     if c_tmr_max is not None:
         spread = stdev(per_tmr_max.values()) if len(per_tmr_max) > 1 else 2.0
         sigma_total = (2.0**2 + spread**2) ** 0.5
-        p_over = monte_carlo_prob_over(threshold, c_tmr_max, sigma_total)
+        p_over = monte_carlo_prob_over(float(threshold_f), c_tmr_max, sigma_total)
         edge = p_over - market_price
         stake = fractional_kelly(p_over, market_price, fraction=0.25)
     else:
@@ -558,6 +741,37 @@ def run_once_struct(q=None, lat=None, lon=None) -> RunResult:
 
     local_tomorrow = (datetime.now(local_tz) + timedelta(days=1)).date().isoformat()
     notes.append(f"Inserted rows: open_meteo={n1}, weather_gov={n2}, tomorrow_io={n3}")
+
+    # Added: Tomorrow Forecast Daily (GET /v4/weather/forecast)
+    forecast_daily = None
+    if include_forecast_daily:
+        forecast_daily, err = fetch_tomorrow_io_forecast_daily(lat0, lon0, location_text=None, units="imperial", timesteps=("1d",))
+        if err:
+            notes.append(f"Tomorrow.io forecast daily error: {err}")
+
+    # Added: Historical + Pandas
+    hist_summary = None
+    hist_csv = None
+    if include_historical:
+        location_str = f"{lat0},{lon0}"
+        df, err = fetch_tomorrow_io_historical_df(
+            location=location_str,
+            fields=historical_fields,
+            timesteps=historical_timesteps,
+            start_time=historical_start,
+            end_time=historical_end,
+        )
+        if err:
+            notes.append(f"Historical fetch error: {err}")
+        else:
+            hist_summary = summarize_historical_df(df)
+            # save CSV
+            if df is not None and pd is not None:
+                os.makedirs(historical_csv_dir, exist_ok=True)
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                hist_csv = os.path.join(historical_csv_dir, f"historical_{location_str.replace(',', '_')}_{ts}.csv")
+                df.to_csv(hist_csv, index=False)
+                notes.append(f"Saved historical CSV: {hist_csv}")
 
     return RunResult(
         ok=True,
@@ -575,19 +789,25 @@ def run_once_struct(q=None, lat=None, lon=None) -> RunResult:
         consensus_last8h_max_f=c_max8,
         consensus_tmr_min_f=c_tmr_min,
         consensus_tmr_max_f=c_tmr_max,
-        threshold_f=threshold,
+        threshold_f=float(threshold_f),
         p_over=p_over,
         market_price=market_price,
         market_source=market_source,
         market_meta=market_meta,
         edge=edge,
         stake=stake,
+        tomorrow_forecast_daily=forecast_daily,
+        historical_summary=hist_summary,
+        historical_csv_path=hist_csv,
     )
 
-def run_once_text(q=None, lat=None, lon=None) -> str:
-    d = run_once_struct(q=q, lat=lat, lon=lon)
 
-    def ff(x): return "N/A" if x is None else f"{x:.1f}F"
+def run_once_text(**kwargs) -> str:
+    d = run_once_struct(**kwargs)
+
+    def ff(x):
+        return "N/A" if x is None else f"{x:.1f}F"
+
     lines = []
     lines.append(f"Generated: {d.generated_at_utc}")
     lines.append(f"Location: {d.location_name} ({d.lat:.4f},{d.lon:.4f}) TZ={d.timezone_name}")
@@ -595,4 +815,56 @@ def run_once_text(q=None, lat=None, lon=None) -> str:
     lines.append(f"Market: {d.market_source} price={d.market_price:.4f} meta={d.market_meta}")
     lines.append(f"Consensus NOW/MIN/MAX(8h): {ff(d.consensus_now_f)} / {ff(d.consensus_last8h_min_f)} / {ff(d.consensus_last8h_max_f)}")
     lines.append(f"Consensus TMR MIN/MAX: {ff(d.consensus_tmr_min_f)} / {ff(d.consensus_tmr_max_f)}")
+    if d.p_over is not None:
+        lines.append(f"P(temp > {d.threshold_f:.1f}F) ≈ {d.p_over:.4f} | edge ≈ {d.edge:.4f} | stake(kelly_frac) ≈ {d.stake:.4f}")
+    if d.tomorrow_forecast_daily is not None:
+        lines.append("Tomorrow.io Forecast Daily (GET /v4/weather/forecast):")
+        lines.append(json.dumps(d.tomorrow_forecast_daily[:5], indent=2) if d.tomorrow_forecast_daily else "[]")
+    if d.historical_summary is not None:
+        lines.append("Historical summary (from Tomorrow.io /v4/historical):")
+        lines.append(json.dumps(d.historical_summary, indent=2))
+    if d.historical_csv_path:
+        lines.append(f"Historical CSV saved at: {d.historical_csv_path}")
+    if d.removed_outliers:
+        lines.append(f"Removed outliers (IQR): {d.removed_outliers}")
+    if d.notes:
+        lines.append("Notes:")
+        lines.extend([f"- {x}" for x in d.notes])
     return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="WeatherEdge: Forecast + Tomorrow.io forecast/historical integration")
+    parser.add_argument("--q", type=str, default=None, help="Location query (US), e.g. 'New York, NY'")
+    parser.add_argument("--lat", type=float, default=None, help="Latitude")
+    parser.add_argument("--lon", type=float, default=None, help="Longitude")
+    parser.add_argument("--threshold", type=float, default=48.0, help="Threshold temperature in F for probability calc")
+
+    parser.add_argument("--no-forecast-daily", action="store_true", help="Disable Tomorrow.io /v4/weather/forecast call")
+    parser.add_argument("--historical", action="store_true", help="Enable Tomorrow.io /v4/historical + pandas analysis")
+    parser.add_argument("--hist-start", type=str, default="nowMinus30d", help="Historical startTime")
+    parser.add_argument("--hist-end", type=str, default="nowMinus15d", help="Historical endTime")
+    parser.add_argument("--hist-fields", type=str, default="temperature,humidity", help="Comma-separated fields")
+    parser.add_argument("--hist-timesteps", type=str, default="1h", help="Comma-separated timesteps")
+    parser.add_argument("--hist-csv-dir", type=str, default=".", help="Where to save historical CSV")
+
+    args = parser.parse_args()
+
+    text = run_once_text(
+        q=args.q,
+        lat=args.lat,
+        lon=args.lon,
+        threshold_f=args.threshold,
+        include_forecast_daily=(not args.no_forecast_daily),
+        include_historical=args.historical,
+        historical_start=args.hist_start,
+        historical_end=args.hist_end,
+        historical_fields=tuple([x.strip() for x in args.hist_fields.split(",") if x.strip()]),
+        historical_timesteps=tuple([x.strip() for x in args.hist_timesteps.split(",") if x.strip()]),
+        historical_csv_dir=args.hist_csv_dir,
+    )
+    print(text)
+
+
+if __name__ == "__main__":
+    main()
