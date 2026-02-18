@@ -5,7 +5,13 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, PlainTextResponse
 
-from app.main import run_once_struct, run_once_text, geocode_us, kalshi_search_series
+# NOTE:
+# - app.py của bạn đang import từ app.main. :contentReference[oaicite:1]{index=1}
+# - Hãy đảm bảo app/main.py có các hàm này (từ weatheredge_full.py):
+#   run_once_struct, run_once_text, geocode_us
+from app.main import run_once_struct, run_once_text, geocode_us
+
+import requests
 
 app = FastAPI()
 
@@ -14,11 +20,14 @@ CACHE_TTL_SECONDS = max(60, REFRESH_MINUTES * 60)
 
 CACHE = {}  # key -> {"ts": epoch, "data": RunResult|None, "err": str|None}
 
+
+# ================== UI helpers ==================
+
 def fmt_f(x):
     return "N/A" if x is None else f"{x:.1f}°F"
 
 def pct(x):
-    return "N/A" if x is None else f"{x*100:.2f}%"
+    return "N/A" if x is None else f"{x * 100:.2f}%"
 
 def badge_for_status(status):
     if status == "OK":
@@ -27,26 +36,125 @@ def badge_for_status(status):
         return ("NO_KEY", "#f97316")
     return ("EMPTY", "#94a3b8")
 
-def cache_key(q, lat, lon):
+def cache_key(q, lat, lon, extra=""):
+    """
+    Cache key cho run default (không historical).
+    Nếu historical bật, tách key riêng để tránh cache nhầm.
+    """
     if lat is not None and lon is not None:
-        return f"latlon:{float(lat):.5f},{float(lon):.5f}"
-    q = (q or "").strip().lower()
-    return f"q:{q}" if q else "default"
+        base = f"latlon:{float(lat):.5f},{float(lon):.5f}"
+    else:
+        qq = (q or "").strip().lower()
+        base = f"q:{qq}" if qq else "default"
+    return base + (f"|{extra}" if extra else "")
 
-def get_cached(q=None, lat=None, lon=None):
-    key = cache_key(q, lat, lon)
+
+# ================== Kalshi series search (self-contained) ==================
+# app.py cũ có /api/kalshi/search và import kalshi_search_series :contentReference[oaicite:2]{index=2}
+# Mình đưa luôn vào đây để không còn ImportError.
+
+KALSHI_ACCESS_KEY = os.getenv("KALSHI_ACCESS_KEY", "").strip()
+KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
+
+def _kalshi_headers():
+    h = {"Accept": "application/json"}
+    if KALSHI_ACCESS_KEY:
+        # Một số môi trường dùng header này
+        h["KALSHI-ACCESS-KEY"] = KALSHI_ACCESS_KEY
+        # Nếu account bạn require bearer, bật dòng dưới:
+        # h["Authorization"] = f"Bearer {KALSHI_ACCESS_KEY}"
+    return h
+
+def kalshi_search_series(q: str, limit: int = 10):
+    """
+    Tìm series trên Kalshi.
+    Endpoint có thể khác nhau tùy môi trường; mình thử 2 kiểu phổ biến:
+    - /trade-api/v2/series?search=...&limit=...
+    - /trade-api/v2/series?query=...&limit=...
+    """
+    q = (q or "").strip()
+    if not q:
+        return None, "Missing query"
+
+    candidates = [
+        f"{KALSHI_BASE_URL}/trade-api/v2/series?search={requests.utils.quote(q)}&limit={int(limit)}",
+        f"{KALSHI_BASE_URL}/trade-api/v2/series?query={requests.utils.quote(q)}&limit={int(limit)}",
+    ]
+
+    last_err = None
+    for url in candidates:
+        try:
+            r = requests.get(url, headers=_kalshi_headers(), timeout=20)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+                continue
+            data = r.json()
+            # vài schema hay gặp: {"series":[...]} hoặc {"data":[...]}
+            series = data.get("series") or data.get("data") or data.get("results")
+            if series is None:
+                # nếu response là list
+                if isinstance(data, list):
+                    series = data
+            if series is None:
+                last_err = "Unexpected response schema"
+                continue
+            return series, None
+        except Exception as e:
+            last_err = str(e)
+
+    return None, last_err or "Kalshi search failed"
+
+
+# ================== Caching ==================
+
+def get_cached_run(q=None, lat=None, lon=None):
+    """
+    Cache cho run mặc định (không bật historical).
+    """
+    key = cache_key(q, lat, lon, extra="default")
     now = time.time()
     it = CACHE.get(key)
     if it and (now - it["ts"] < CACHE_TTL_SECONDS) and it.get("data") is not None:
         return it["data"], key, True, None
 
     try:
-        data = run_once_struct(q=q, lat=lat, lon=lon)
+        data = run_once_struct(
+            q=q, lat=lat, lon=lon,
+            include_forecast_daily=True,
+            include_historical=False,
+        )
         CACHE[key] = {"ts": now, "data": data, "err": None}
         return data, key, False, None
     except Exception as e:
         CACHE[key] = {"ts": now, "data": None, "err": str(e)}
         return None, key, False, str(e)
+
+
+def run_historical(q=None, lat=None, lon=None,
+                   hist_start="nowMinus30d",
+                   hist_end="nowMinus15d",
+                   hist_fields="temperature,humidity",
+                   hist_timesteps="1h",
+                   hist_csv_dir="."):
+    """
+    Không cache historical theo TTL mặc định (vì nặng) – nhưng bạn có thể bật cache nếu muốn.
+    """
+    fields = tuple([x.strip() for x in (hist_fields or "").split(",") if x.strip()])
+    timesteps = tuple([x.strip() for x in (hist_timesteps or "").split(",") if x.strip()])
+
+    return run_once_struct(
+        q=q, lat=lat, lon=lon,
+        include_forecast_daily=True,
+        include_historical=True,
+        historical_start=hist_start,
+        historical_end=hist_end,
+        historical_fields=fields,
+        historical_timesteps=timesteps,
+        historical_csv_dir=hist_csv_dir,
+    )
+
+
+# ================== Routes ==================
 
 @app.get("/health")
 def health():
@@ -57,20 +165,33 @@ def health():
         "server_time_utc": datetime.now(timezone.utc).isoformat(),
     }
 
+
 @app.get("/api/geocode")
 def api_geocode(q: str = Query(..., min_length=2)):
     return {"ok": True, "results": geocode_us(q, count=7)}
 
+
 @app.get("/api/run", response_class=PlainTextResponse)
 def api_run(q: str = None, lat: float = None, lon: float = None):
+    """
+    Text output kiểu cũ.
+    """
     try:
         return run_once_text(q=q, lat=lat, lon=lon) + "\n"
     except Exception as e:
         return PlainTextResponse(f"ERROR: {e}\n", status_code=200)
 
+
 @app.get("/api/latest.json")
-def api_latest(q: str = None, lat: float = None, lon: float = None):
-    d, key, hit, err = get_cached(q=q, lat=lat, lon=lon)
+def api_latest(
+    q: str = None,
+    lat: float = None,
+    lon: float = None,
+):
+    """
+    Latest cached run (không historical), nhưng CÓ forecast daily.
+    """
+    d, key, hit, err = get_cached_run(q=q, lat=lat, lon=lon)
     if err:
         return {"ok": False, "cache_key": key, "cache_hit": hit, "error": err}
 
@@ -105,6 +226,13 @@ def api_latest(q: str = None, lat: float = None, lon: float = None):
         "removed_outliers": d.removed_outliers,
         "notes": d.notes,
 
+        # NEW: Tomorrow.io forecast daily (GET /v4/weather/forecast)
+        "tomorrow_forecast_daily": d.tomorrow_forecast_daily,
+
+        # NEW: Historical (disabled here)
+        "historical_summary": d.historical_summary,
+        "historical_csv_path": d.historical_csv_path,
+
         "sources": [
             {
                 "src": s.src,
@@ -119,6 +247,45 @@ def api_latest(q: str = None, lat: float = None, lon: float = None):
         ],
     }
 
+
+@app.get("/api/historical.json")
+def api_historical(
+    q: str = None,
+    lat: float = None,
+    lon: float = None,
+    hist_start: str = "nowMinus30d",
+    hist_end: str = "nowMinus15d",
+    hist_fields: str = "temperature,humidity",
+    hist_timesteps: str = "1h",
+    hist_csv_dir: str = ".",
+):
+    """
+    Bật historical (Tomorrow.io /v4/historical + Pandas analysis).
+    """
+    try:
+        d = run_historical(
+            q=q, lat=lat, lon=lon,
+            hist_start=hist_start,
+            hist_end=hist_end,
+            hist_fields=hist_fields,
+            hist_timesteps=hist_timesteps,
+            hist_csv_dir=hist_csv_dir,
+        )
+        return {
+            "ok": True,
+            "generated_at_utc": d.generated_at_utc,
+            "location_name": d.location_name,
+            "timezone_name": d.timezone_name,
+            "lat": d.lat,
+            "lon": d.lon,
+            "historical_summary": d.historical_summary,
+            "historical_csv_path": d.historical_csv_path,
+            "notes": d.notes,
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 @app.get("/api/kalshi/search")
 def api_kalshi_search(q: str = Query(..., min_length=2), limit: int = 10):
     series, err = kalshi_search_series(q, limit=limit)
@@ -127,15 +294,23 @@ def api_kalshi_search(q: str = Query(..., min_length=2), limit: int = 10):
 
     out = []
     for s in series:
+        if not isinstance(s, dict):
+            continue
         out.append({
             "ticker": s.get("ticker") or s.get("series_ticker") or s.get("id"),
             "title": s.get("title") or s.get("name") or s.get("question") or s.get("subtitle"),
         })
     return {"ok": True, "results": out}
 
+
 @app.get("/", response_class=HTMLResponse)
 def home(q: str = None, lat: float = None, lon: float = None):
-    d, key, hit, err = get_cached(q=q, lat=lat, lon=lon)
+    """
+    Trang HTML: giữ layout cũ, bổ sung 2 card:
+    - Tomorrow.io Forecast Daily
+    - Link Historical
+    """
+    d, key, hit, err = get_cached_run(q=q, lat=lat, lon=lon)
     q_val = (q or "").replace('"', "&quot;")
 
     if err:
@@ -208,6 +383,39 @@ def home(q: str = None, lat: float = None, lon: float = None):
     </div>
     """
 
+    # NEW: forecast daily card
+    forecast_preview = ""
+    if d.tomorrow_forecast_daily is None:
+        forecast_preview = '<div class="sub">No daily forecast (check TOMORROW_KEY).</div>'
+    else:
+        # show first 5 days
+        items = d.tomorrow_forecast_daily[:5]
+        lis = ""
+        for it in items:
+            t = it.get("time")
+            tmax = it.get("temperatureMax")
+            tmin = it.get("temperatureMin")
+            lis += f"<li class='sub'><span class='mono'>{t}</span> · min={tmin} · max={tmax}</li>"
+        forecast_preview = f"<ul style='margin:8px 0 0 18px;padding:0;'>{lis}</ul>"
+
+    forecast_card = f"""
+    <div class="card">
+      <h2 style="margin:0 0 8px;color:var(--muted);font-size:16px;">Tomorrow.io Forecast Daily</h2>
+      <div class="sub">From: <span class="mono">GET /v4/weather/forecast</span></div>
+      {forecast_preview}
+      <div class="sub" style="margin-top:10px;">Raw JSON: <span class="mono">/api/latest.json</span></div>
+    </div>
+    """
+
+    historical_card = f"""
+    <div class="card">
+      <h2 style="margin:0 0 8px;color:var(--muted);font-size:16px;">Historical (Tomorrow.io)</h2>
+      <div class="sub">Run historical + pandas analysis:</div>
+      <div class="sub"><span class="mono">/api/historical.json?q=Seattle, WA&hist_start=nowMinus30d&hist_end=nowMinus15d</span></div>
+      <div class="sub" style="margin-top:6px;">Tip: historical cần <span class="mono">pandas</span> và TOMORROW_KEY.</div>
+    </div>
+    """
+
     return f"""
     <html>
       <head>
@@ -276,6 +484,9 @@ def home(q: str = None, lat: float = None, lon: float = None):
               <tbody>{rows_tmr}</tbody>
             </table>
           </div>
+
+          {forecast_card}
+          {historical_card}
         </div>
       </body>
     </html>
