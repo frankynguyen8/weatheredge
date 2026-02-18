@@ -19,9 +19,10 @@ TOMORROW_KEY = os.getenv("TOMORROW_KEY", "").strip()
 
 EXPECTED_SOURCES = ["open_meteo", "weather_gov", "tomorrow_io"]
 
-# Optional Kalshi market data (public)
-KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER", "").strip()
+# Kalshi read-only
+KALSHI_ACCESS_KEY = os.getenv("KALSHI_ACCESS_KEY", "").strip()
 KALSHI_BASE_URL = os.getenv("KALSHI_BASE_URL", "https://api.elections.kalshi.com").rstrip("/")
+KALSHI_MARKET_TICKER = os.getenv("KALSHI_MARKET_TICKER", "").strip()
 
 # ================= HTTP SAFE =================
 
@@ -67,7 +68,6 @@ def stdev(xs):
     return var ** 0.5
 
 def quantile(sorted_xs, q):
-    """Linear interpolation quantile. q in [0,1]. sorted_xs must be sorted."""
     n = len(sorted_xs)
     if n == 0:
         return None
@@ -80,10 +80,6 @@ def quantile(sorted_xs, q):
     return float(sorted_xs[lo] * (1 - frac) + sorted_xs[hi] * frac)
 
 def remove_outliers_iqr(values_dict):
-    """
-    values_dict: {source: value}
-    returns filtered dict
-    """
     if not values_dict or len(values_dict) < 3:
         return values_dict
 
@@ -100,15 +96,11 @@ def remove_outliers_iqr(values_dict):
     return filtered if len(filtered) >= 2 else values_dict
 
 def monte_carlo_prob_over(threshold_f, mean_f, sigma_f, sims=20000, seed=7):
-    """
-    Normal draws without numpy (Box-Muller).
-    """
     import random, math
     random.seed(seed)
     sigma = max(0.1, float(sigma_f))
     count = 0
     for _ in range(sims):
-        # Box-Muller
         u1 = max(1e-12, random.random())
         u2 = random.random()
         z = math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2)
@@ -131,7 +123,6 @@ def geocode_us(query, count=5):
     q = (query or "").strip()
     if not q:
         return []
-
     url = (
         "https://geocoding-api.open-meteo.com/v1/search"
         f"?name={requests.utils.quote(q)}&count={count}&language=en&format=json"
@@ -139,7 +130,6 @@ def geocode_us(query, count=5):
     r = safe_get(url, timeout=15, retries=2)
     if not r or r.status_code != 200:
         return []
-
     try:
         j = r.json()
         out = []
@@ -194,7 +184,6 @@ def table_columns(con, table):
 def migrate_schema(con):
     cols = set(table_columns(con, "hourly_forecast"))
 
-    # Create if missing (old deployments)
     if not cols:
         con.execute("""
             CREATE TABLE IF NOT EXISTS hourly_forecast(
@@ -217,7 +206,6 @@ def migrate_schema(con):
     if altered:
         con.commit()
 
-    # Backfill NULL lat/lon rows to default to avoid select filters returning empty
     con.execute(
         "UPDATE hourly_forecast SET lat=?, lon=? WHERE lat IS NULL OR lon IS NULL",
         (DEFAULT_LAT, DEFAULT_LON),
@@ -271,14 +259,11 @@ def in_horizon(dt, horizon_hours=48):
 def last_hours_now_minmax(series, hours=8):
     if not series:
         return None, None, None
-
     now = datetime.now(timezone.utc)
     start = now - timedelta(hours=hours)
-
     window = [tf for dt, tf in series if start <= dt <= now]
     mn = min(window) if window else None
     mx = max(window) if window else None
-
     past = [(dt, tf) for dt, tf in series if dt <= now]
     now_tf = past[-1][1] if past else None
     return now_tf, mn, mx
@@ -293,7 +278,7 @@ def day_minmax_local(series, local_tz, day_offset=1):
         return None, None
     return min(vals), max(vals)
 
-# ================= FETCHERS =================
+# ================= WEATHER FETCHERS =================
 
 def fetch_open_meteo(lat, lon, horizon_hours=48):
     url = (
@@ -303,7 +288,7 @@ def fetch_open_meteo(lat, lon, horizon_hours=48):
         "&temperature_unit=fahrenheit"
         "&timezone=UTC"
     )
-    r = safe_get(url, timeout=20, retries=2)
+    r = safe_get(url, timeout=20, retries=3)
     if not r or r.status_code != 200:
         return []
     try:
@@ -322,7 +307,7 @@ def fetch_weather_gov(lat, lon, horizon_hours=48):
         "User-Agent": "WeatherEdge (contact: long22nguyenhuu@icloud.com)",
         "Accept": "application/geo+json",
     }
-    p = safe_get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers, timeout=20, retries=2)
+    p = safe_get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers, timeout=20, retries=3)
     if not p or p.status_code != 200:
         return []
     try:
@@ -330,7 +315,7 @@ def fetch_weather_gov(lat, lon, horizon_hours=48):
     except Exception:
         return []
 
-    r = safe_get(forecast_url, headers=headers, timeout=20, retries=2)
+    r = safe_get(forecast_url, headers=headers, timeout=20, retries=3)
     if not r or r.status_code != 200:
         return []
     try:
@@ -355,8 +340,7 @@ def fetch_tomorrow_io(lat, lon, horizon_hours=48):
         "units": "imperial",
     }
     headers = {"Content-Type": "application/json", "apikey": TOMORROW_KEY}
-
-    r = safe_post(url, headers=headers, json_body=payload, timeout=20, retries=2)
+    r = safe_post(url, headers=headers, json_body=payload, timeout=20, retries=3)
     if not r or r.status_code != 200:
         return []
     try:
@@ -372,37 +356,85 @@ def fetch_tomorrow_io(lat, lon, horizon_hours=48):
     except Exception:
         return []
 
-# ================= KALSHI MARKET (PUBLIC) =================
+# ================= KALSHI READ-ONLY (NO RSA) =================
 
-def fetch_kalshi_yes_price(ticker):
-    if not ticker:
-        return None, None
-    url = f"{KALSHI_BASE_URL}/trade-api/v2/markets/{ticker}"
-    r = safe_get(url, timeout=15, retries=2)
-    if not r or r.status_code != 200:
-        return None, None
+def kalshi_headers_readonly():
+    h = {"Accept": "application/json"}
+    if KALSHI_ACCESS_KEY:
+        # many environments accept this
+        h["KALSHI-ACCESS-KEY"] = KALSHI_ACCESS_KEY
+        # if your environment requires bearer, enable:
+        # h["Authorization"] = f"Bearer {KALSHI_ACCESS_KEY}"
+    return h
+
+def kalshi_get_readonly(path: str):
+    url = KALSHI_BASE_URL + path
+    r = safe_get(url, headers=kalshi_headers_readonly(), timeout=20, retries=2)
+    if not r:
+        return None, "No response"
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
     try:
-        m = (r.json() or {}).get("market", {}) or {}
-        if m.get("yes_ask_dollars") is not None:
-            return float(m["yes_ask_dollars"]), "yes_ask_dollars"
-        if m.get("last_price_dollars") is not None:
-            return float(m["last_price_dollars"]), "last_price_dollars"
+        return r.json(), None
+    except Exception as e:
+        return None, str(e)
+
+def kalshi_search_series(q: str, limit: int = 10):
+    q = (q or "").strip()
+    if not q:
+        return [], None
+    data, err = kalshi_get_readonly(f"/trade-api/v2/series?search={requests.utils.quote(q)}&limit={limit}")
+    if err:
+        return [], err
+    return (data.get("series") or []), None
+
+def kalshi_get_market(ticker: str):
+    if not ticker:
+        return None, "Missing ticker"
+    return kalshi_get_readonly(f"/trade-api/v2/markets/{ticker}")
+
+def extract_yes_price_dollars(market_obj: dict):
+    if not market_obj:
         return None, None
-    except Exception:
-        return None, None
+    m = market_obj.get("market") if "market" in market_obj else market_obj
+
+    for field in ("yes_ask_dollars", "yes_bid_dollars", "last_price_dollars"):
+        v = m.get(field)
+        if v is not None:
+            try:
+                return float(v), field
+            except Exception:
+                pass
+
+    for field in ("yes_ask", "yes_bid", "last_price"):
+        v = m.get(field)
+        if v is not None:
+            try:
+                return float(v) / 100.0, field
+            except Exception:
+                pass
+
+    return None, None
+
+def fetch_kalshi_yes_price(ticker: str):
+    data, err = kalshi_get_market(ticker)
+    if err:
+        return None, None, err
+    price, field = extract_yes_price_dollars(data)
+    if price is None:
+        return None, None, "No YES price fields in response"
+    return price, field, None
 
 def read_market_price():
-    p, used = fetch_kalshi_yes_price(KALSHI_MARKET_TICKER)
-    if p is not None:
-        return p, "kalshi", {"ticker": KALSHI_MARKET_TICKER, "field": used}
+    if KALSHI_MARKET_TICKER:
+        p, field, err = fetch_kalshi_yes_price(KALSHI_MARKET_TICKER)
+        if p is not None:
+            return p, "kalshi", {"ticker": KALSHI_MARKET_TICKER, "field": field}
+        fallback = float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17"))
+        return fallback, "env_fallback", {"env": "MARKET_PRICE_YES_OVER_48", "kalshi_error": err}
 
-    # legacy local_json
-    try:
-        with open("/app/market.json", "r", encoding="utf-8") as f:
-            j = json.load(f)
-        return float(j["market_price_yes_over_48"]), "local_json", {"path": "/app/market.json"}
-    except Exception:
-        return float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17")), "env_fallback", {"env": "MARKET_PRICE_YES_OVER_48"}
+    fallback = float(os.getenv("MARKET_PRICE_YES_OVER_48", "0.17"))
+    return fallback, "env_fallback", {"env": "MARKET_PRICE_YES_OVER_48", "kalshi_error": "Missing KALSHI_MARKET_TICKER"}
 
 # ================= MODELS =================
 
@@ -497,8 +529,6 @@ def run_once_struct(q=None, lat=None, lon=None) -> RunResult:
             tmr_max_f=tmax,
         ))
 
-    removed = []
-
     def consensus(vals_dict):
         if not vals_dict:
             return None, []
@@ -558,33 +588,11 @@ def run_once_text(q=None, lat=None, lon=None) -> str:
     d = run_once_struct(q=q, lat=lat, lon=lon)
 
     def ff(x): return "N/A" if x is None else f"{x:.1f}F"
-
     lines = []
     lines.append(f"Generated: {d.generated_at_utc}")
     lines.append(f"Location: {d.location_name} ({d.lat:.4f},{d.lon:.4f}) TZ={d.timezone_name}")
     lines.append(f"Tomorrow (local): {d.local_tomorrow_date}")
-    lines.append(f"Market: {d.market_source} price={d.market_price:.4f}")
-
-    lines.append("\nNOW + last 8h consensus:")
-    lines.append(f"NOW / MIN / MAX: {ff(d.consensus_now_f)} / {ff(d.consensus_last8h_min_f)} / {ff(d.consensus_last8h_max_f)}")
-
-    lines.append("\nTomorrow consensus MIN/MAX:")
-    lines.append(f"MIN / MAX: {ff(d.consensus_tmr_min_f)} / {ff(d.consensus_tmr_max_f)}")
-
-    for s in d.sources:
-        lines.append(f"\n[{s.src}] status={s.status} inserted={s.rows_inserted}")
-        lines.append(f"Now / 8h MIN / 8h MAX: {ff(s.now_f)} / {ff(s.last8h_min_f)} / {ff(s.last8h_max_f)}")
-        lines.append(f"Tomorrow MIN/MAX: {ff(s.tmr_min_f)} / {ff(s.tmr_max_f)}")
-
-    if d.p_over is not None:
-        lines.append(f"\nP(TMAX > {d.threshold_f:.0f}F): {d.p_over*100:.2f}%")
-        lines.append(f"Edge: {(d.edge*100):.2f}% | Stake(25% Kelly): {(d.stake*100):.2f}%")
-
-    if d.removed_outliers:
-        lines.append(f"\nOutliers removed: {d.removed_outliers}")
-
-    if d.notes:
-        lines.append("\nNotes:")
-        lines.extend([f"- {x}" for x in d.notes])
-
+    lines.append(f"Market: {d.market_source} price={d.market_price:.4f} meta={d.market_meta}")
+    lines.append(f"Consensus NOW/MIN/MAX(8h): {ff(d.consensus_now_f)} / {ff(d.consensus_last8h_min_f)} / {ff(d.consensus_last8h_max_f)}")
+    lines.append(f"Consensus TMR MIN/MAX: {ff(d.consensus_tmr_min_f)} / {ff(d.consensus_tmr_max_f)}")
     return "\n".join(lines)
